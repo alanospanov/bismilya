@@ -31,7 +31,14 @@ export default function App() {
     setAuthed(true);
   };
 
+  // выход на страницу регистрации: сбрасываем гостя и сессию Supabase
+  const logout = async () => {
+    try { localStorage.removeItem(GUEST_KEY); } catch { /* нет localStorage */ }
+    if (supabase) { try { await supabase.auth.signOut(); } catch { /* offline */ } }
+    setAuthed(false);
+  };
+
   if (!ready) return null; // короткая пауза, пока проверяется сессия
   if (!authed) return <Auth onGuest={enterAsGuest} />;
-  return <Space3D />;
+  return <Space3D onLogout={logout} />;
 }

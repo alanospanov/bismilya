@@ -10,7 +10,7 @@ type Battery = { group: THREE.Group; delivered: boolean; carried: boolean; locke
 const TOTAL_BATTERIES = 3;
 const SAVE_KEY = 'spaidcan_save'; // ключ сохранённого прогресса в localStorage
 
-export function Space3D() {
+export function Space3D({ onLogout }: { onLogout?: () => void }) {
   const mountRef = useRef<HTMLDivElement>(null);
   // Счётчик доставленных батареек, флаг победы, несёт ли игрок батарейку сейчас
   const [collected, setCollected] = useState(0);
@@ -914,6 +914,19 @@ export function Space3D() {
             }}
           >
             ⚙ Настройки
+          </button>
+
+          {/* Кнопка «Выйти» — маленькая, в левом верхнем углу */}
+          <button
+            onClick={() => onLogout?.()}
+            style={{
+              position: 'absolute', top: 12, left: 12,
+              padding: '6px 14px', fontSize: 13, fontWeight: 'bold', fontFamily: 'monospace',
+              background: 'rgba(192,57,43,0.85)', color: '#fff',
+              border: 'none', borderRadius: 8, cursor: 'pointer',
+            }}
+          >
+            Выйти
           </button>
 
           {/* Настоящая морда паука (фото) — правая часть экрана, круглый кроп */}
