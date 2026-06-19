@@ -7,14 +7,43 @@ type Rect = { minX: number; maxX: number; minZ: number; maxZ: number };
 // Батарейка: меш + состояние (доставлена в генератор / несётся игроком /
 // заблокирована от мгновенного повторного подбора сразу после выброса)
 type Battery = { group: THREE.Group; delivered: boolean; carried: boolean; locked: boolean };
-const TOTAL_BATTERIES = 3;
+// Переключатель: меш + флаг активации + функция смены вида (красный↔зелёный)
+type Switch = { group: THREE.Group; x: number; z: number; active: boolean; setActive: (b: boolean) => void };
 const SAVE_KEY = 'spaidcan_save'; // ключ сохранённого прогресса в localStorage
+const LEVELS = 6;                 // всего уровней
+
+// Конфиг уровня: чем дальше — тем больше батареек и рандома. Переключатели
+// появляются после 3-го уровня, выступы-карманы (альковы) — после 4-го.
+function levelConfig(level: number) {
+  const lv = Math.min(LEVELS, Math.max(1, level));
+  return {
+    batteries: 2 + lv,                              // L1=3 … L6=8
+    randomness: Math.min(1, 0.12 + (lv - 1) * 0.18), // разброс спавна растёт
+    switches: lv >= 4 ? lv - 3 : 0,                 // L4=1, L5=2, L6=3
+    alcoves: lv >= 5 ? lv - 4 : 0,                  // L5=1, L6=2 (чуть-чуть выступов)
+  };
+}
+
+// Начальный уровень читаем из сохранения (чтобы сцена сразу строила нужный уровень)
+function initialLevel(): number {
+  try {
+    const r = localStorage.getItem(SAVE_KEY);
+    if (r) { const s = JSON.parse(r); if (s && typeof s.level === 'number') return Math.min(LEVELS, Math.max(1, s.level)); }
+  } catch { /* нет localStorage */ }
+  return 1;
+}
 
 export function Space3D({ onLogout }: { onLogout?: () => void }) {
   const mountRef = useRef<HTMLDivElement>(null);
   // Счётчик доставленных батареек, флаг победы, несёт ли игрок батарейку сейчас
   const [collected, setCollected] = useState(0);
   const [won, setWon] = useState(false);
+  // Система уровней: текущий уровень, экран «уровень пройден», счётчики для HUD
+  const [level, setLevel] = useState(initialLevel);
+  const [levelCleared, setLevelCleared] = useState(false);
+  const [batteryCount, setBatteryCount] = useState(() => levelConfig(initialLevel()).batteries);
+  const [switchCount, setSwitchCount] = useState(0);
+  const [switchesOn, setSwitchesOn] = useState(0);
   // started — false на главном экране (меню), true после нажатия «Играть»
   const [started, setStarted] = useState(false);
   // paused — игра на паузе (экран Escape); exited — экран выхода из игры
@@ -25,6 +54,10 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   const getStateRef = useRef<(() => unknown) | undefined>(undefined); // снимок состояния для сохранения
   const audioRef = useRef<HTMLAudioElement | null>(null); // «лифтовая» музыка меню
   const [muted, setMuted] = useState(false);
+  // Вид от первого лица (true) ↔ от третьего (false). Кнопка переключает туда-обратно.
+  const [firstPerson, setFirstPerson] = useState(false);
+  const firstPersonRef = useRef(false); // читается из игрового цикла
+  useEffect(() => { firstPersonRef.current = firstPerson; }, [firstPerson]);
   // runId меняется при «Играть заново» → useEffect пересоздаёт всю сцену
   const [runId, setRunId] = useState(0);
 
@@ -36,7 +69,17 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   const exitGame = () => { saveProgress(); resume(); setStarted(false); setExited(true); }; // выйти из игры
   const restart = () => {
     try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
-    resume(); setCollected(0); setWon(false); setRunId((r) => r + 1);
+    resume(); setCollected(0); setWon(false); setLevelCleared(false);
+    setSwitchesOn(0); setLevel(1); setBatteryCount(levelConfig(1).batteries); setSwitchCount(0);
+    setRunId((r) => r + 1);
+  };
+  // Переход на следующий уровень (после экрана «уровень пройден»).
+  // Сохраняем только номер уровня → новый уровень строится с чистого листа.
+  const nextLevel = () => {
+    const nl = Math.min(LEVELS, level + 1);
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify({ level: nl })); } catch { /* нет localStorage */ }
+    resume(); setLevelCleared(false); setCollected(0); setSwitchesOn(0); setWon(false);
+    setLevel(nl); setRunId((r) => r + 1);
   };
   // Функция выброса батарейки — назначается внутри игрового цикла,
   // вызывается с клавиши Q.
@@ -66,6 +109,15 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
+
+    // ── Конфиг текущего уровня ─────────────────────────────
+    const levelNum = level;
+    const cfg = levelConfig(levelNum);
+    const batteryGoal = cfg.batteries;   // сколько батареек нужно доставить
+    const switchGoal = cfg.switches;     // сколько переключателей нужно дёрнуть
+    // сброс HUD под новый уровень (загрузка сохранения ниже может уточнить счётчики)
+    setBatteryCount(batteryGoal); setSwitchCount(switchGoal);
+    setCollected(0); setSwitchesOn(0);
 
     // ── Сцена / камера / рендерер ──────────────────────────
     const scene = new THREE.Scene();
@@ -396,8 +448,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     colliders.push(genRect);
 
     // ── Батарейки ──────────────────────────────────────────
-    // Спавнятся ОДИН раз в начале (3 шт.) по краям главного коридора (z=0),
-    // который тянется от левого до правого края карты. Светятся зелёным,
+    // Спавнятся ОДИН раз в начале по достижимым клеткам карты. Светятся зелёным,
     // чтобы их было видно в темноте. Игрок подбирает одну за раз, несёт к
     // генератору; при касании коллизий батарейка исчезает (доставлена).
     function makeBattery(x: number, z: number): Battery {
@@ -428,18 +479,160 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       scene.add(g);
       return { group: g, delivered: false, carried: false, locked: false };
     }
-    // 5 готовых раскладок батареек у КРАЁВ карты (центр и генератор исключены).
-    // Каждый запуск игра выбирает одну из них случайно. Все точки проверены
-    // заливкой как достижимые для игрока. [x, z] в координатах мира.
-    const COMBOS: [number, number][][] = [
-      [[-52, 0], [52, -6], [52, 6]],      // 1: запад + восток (верх/низ)
-      [[-50, -15], [50, -15], [-52, 3]],  // 2: два верхних угла + запад
-      [[-50, 15], [50, 15], [52, -6]],    // 3: два нижних угла + северо-восток
-      [[-45, -15], [52, 5], [-52, -6]],   // 4: верх-лево + юго-восток + запад
-      [[45, -15], [-45, 15], [-52, 6]],   // 5: верх-право + низ-лево + запад
-    ];
-    const BATTERY_SPAWNS = COMBOS[Math.floor(Math.random() * COMBOS.length)];
-    const batteries: Battery[] = BATTERY_SPAWNS.map(([x, z]) => makeBattery(x, z));
+    // ── Переключатель (сирена) ─────────────────────────────
+    // Стоит на месте — нести никуда не надо. Дёрнул (клавиша E рядом) → лампа
+    // краснея становится зелёной, рычаг откидывается, ревёт сирена. Пока не
+    // дёрнуты ВСЕ переключатели — на следующий уровень не пускает.
+    function makeSwitch(x: number, z: number): Switch {
+      const g = new THREE.Group();
+      const base = new THREE.Mesh(
+        new THREE.BoxGeometry(0.8, 1.5, 0.45),
+        new THREE.MeshStandardMaterial({ color: 0x2b2f37, metalness: 0.85, roughness: 0.4 }),
+      );
+      base.position.y = 0.75; base.castShadow = true; base.receiveShadow = true;
+      const lampMat = new THREE.MeshStandardMaterial({ color: 0xff2200, emissive: 0xff1400, emissiveIntensity: 1.3 });
+      const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.22, 16, 16), lampMat);
+      lamp.position.y = 1.62;
+      const lever = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.07, 0.07, 0.62, 10),
+        new THREE.MeshStandardMaterial({ color: 0xe2e2e2, metalness: 0.9, roughness: 0.3 }),
+      );
+      lever.position.set(0, 1.05, 0.28); lever.rotation.x = 0.7;
+      const light = new THREE.PointLight(0xff2200, 5, 7, 2); light.position.y = 1.62;
+      g.add(base, lamp, lever, light);
+      g.position.set(x, 0, z);
+      scene.add(g);
+      // переключатель — препятствие (нельзя пройти насквозь)
+      colliders.push({ minX: x - 0.5, maxX: x + 0.5, minZ: z - 0.3, maxZ: z + 0.3 });
+      const setActive = (b: boolean) => {
+        lampMat.color.set(b ? 0x33ff66 : 0xff2200);
+        lampMat.emissive.set(b ? 0x22ff44 : 0xff1400);
+        light.color.set(b ? 0x33ff66 : 0xff2200);
+        lever.rotation.x = b ? -0.7 : 0.7;
+      };
+      return { group: g, x, z, active: false, setActive };
+    }
+
+    // ── Достижимость карты (флуд-фолл по сетке) ─────────────
+    // Чтобы батарейки/переключатели не спавнились в стенах или в отрезанных
+    // карманах, считаем все клетки, до которых игрок реально доходит со спавна.
+    const minWX = wx(0), maxWX = wx(cols * 2), minWZ = wz(0), maxWZ = wz(rows * 2);
+    // расстояние от точки до ближайшей стены (0 — внутри стены)
+    const clearAt = (x: number, z: number) => {
+      let m = Infinity;
+      for (const b of colliders) {
+        const cx = Math.max(b.minX, Math.min(x, b.maxX));
+        const cz = Math.max(b.minZ, Math.min(z, b.maxZ));
+        const d = Math.hypot(x - cx, z - cz);
+        if (d < m) m = d;
+      }
+      return m;
+    };
+    const STEP = 1.0, STAND = 1.3, GAP = 0.4; // шаг сетки, зазор «стоять» / «протиснуться»
+    function computeReach(): { x: number; z: number }[] {
+      const reach: { x: number; z: number }[] = [];
+      const seen = new Set<string>();
+      const key = (ix: number, iz: number) => ix + '|' + iz;
+      const sIx = Math.round(9.5 / STEP), sIz = 0; // стартовая клетка = спавн игрока
+      const queue: [number, number][] = [[sIx, sIz]];
+      seen.add(key(sIx, sIz));
+      while (queue.length) {
+        const [ix, iz] = queue.shift()!;
+        const x = ix * STEP, z = iz * STEP;
+        if (clearAt(x, z) >= STAND) reach.push({ x, z });
+        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+          const nx = ix + dx, nz = iz + dz, wxp = nx * STEP, wzp = nz * STEP;
+          if (wxp < minWX || wxp > maxWX || wzp < minWZ || wzp > maxWZ) continue;
+          if (seen.has(key(nx, nz))) continue;
+          if (clearAt(wxp, wzp) < GAP) { seen.add(key(nx, nz)); continue; }      // соседняя клетка в стене
+          if (clearAt((x + wxp) / 2, (z + wzp) / 2) < GAP) continue;             // между клетками стена
+          seen.add(key(nx, nz)); queue.push([nx, nz]);
+        }
+      }
+      return reach;
+    }
+
+    const shuffle = <T,>(a: T[]) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+    // ── Выступы-карманы (альковы) ──────────────────────────
+    // На поздних уровнях у краёв карты делаем маленькие «выступы»: 3 стены
+    // образуют карман, открытый ТОЛЬКО в сторону центра (вход не в открытое
+    // пространство, а из коридора). Внутри спавнятся переключатель и батарейка.
+    const alcoveSpots: { x: number; z: number }[] = [];
+    function buildAlcoves(count: number) {
+      if (count <= 0) return;
+      const reach1 = computeReach();
+      const cand = shuffle(reach1.filter((c) =>
+        Math.abs(c.x) > 22 && clearAt(c.x, c.z) >= 1.7 && Math.abs(c.z) < 13,
+      ));
+      const D = 2.2, T2 = TH;
+      for (const c of cand) {
+        if (alcoveSpots.length >= count) break;
+        if (alcoveSpots.some((o) => Math.hypot(o.x - c.x, o.z - c.z) < 16)) continue;
+        const sgn = c.x > 0 ? 1 : -1;                 // «спина» алькова — у края, вход — к центру
+        addWall(c.x + sgn * D, c.z, T2, 2 * D + T2);  // задняя стена карманa
+        addWall(c.x + sgn * D / 2, c.z - D, D + T2, T2); // боковая
+        addWall(c.x + sgn * D / 2, c.z + D, D + T2, T2); // боковая
+        alcoveSpots.push({ x: c.x, z: c.z });
+      }
+    }
+    buildAlcoves(cfg.alcoves);
+
+    // ── Достижимые клетки с учётом альковов ────────────────
+    const reach = computeReach();
+    // выбрать n точек из пула с минимальным расстоянием между ними и от запретных
+    function pickSpawns(n: number, avoid: { x: number; z: number }[], minSep: number) {
+      const pool = shuffle(reach.filter((c) =>
+        clearAt(c.x, c.z) >= 1.45 &&
+        Math.hypot(c.x - 9.5, c.z - 0) > 7 &&                 // не у самого спавна
+        Math.hypot(c.x - GEN_X, c.z - GEN_Z) > 5,             // не у генератора
+      ));
+      const chosen: { x: number; z: number }[] = [];
+      const taken = [...avoid];
+      let sep = minSep;
+      while (chosen.length < n && sep > 1.4) {
+        for (const c of pool) {
+          if (chosen.length >= n) break;
+          if (chosen.includes(c)) continue;
+          if (taken.every((p) => Math.hypot(p.x - c.x, p.z - c.z) >= sep)) { chosen.push(c); taken.push(c); }
+        }
+        sep *= 0.7; // не набралось — ослабляем требование к разбросу
+      }
+      return chosen;
+    }
+    // лёгкий джиттер вокруг клетки (рандом тем больше, чем выше уровень)
+    const jitter = (c: { x: number; z: number }) => {
+      const r = cfg.randomness * 2.4;
+      for (let t = 0; t < 6; t++) {
+        const nx = c.x + (Math.random() - 0.5) * 2 * r, nz = c.z + (Math.random() - 0.5) * 2 * r;
+        if (clearAt(nx, nz) >= 1.3) return { x: nx, z: nz };
+      }
+      return c;
+    };
+
+    // ── Раскладка переключателей ───────────────────────────
+    // В альковах — по переключателю, остальные (если их больше) — по карте.
+    const switchPts: { x: number; z: number }[] = [];
+    for (const a of alcoveSpots) { if (switchPts.length < switchGoal) switchPts.push({ x: a.x, z: a.z }); }
+    if (switchPts.length < switchGoal) {
+      switchPts.push(...pickSpawns(switchGoal - switchPts.length, switchPts, 12));
+    }
+    const switchesArr: Switch[] = switchPts.slice(0, switchGoal).map((p) => makeSwitch(p.x, p.z));
+
+    // ── Раскладка батареек ─────────────────────────────────
+    // В альковах рядом с переключателем тоже кладём батарейку, остальные — по карте.
+    const batteryPts: { x: number; z: number }[] = [];
+    for (const a of alcoveSpots) {
+      if (batteryPts.length >= batteryGoal) break;
+      const sgn = a.x > 0 ? 1 : -1;
+      batteryPts.push({ x: a.x - sgn * 1.0, z: a.z }); // сдвиг к выходу алькова, рядом с переключателем
+    }
+    if (batteryPts.length < batteryGoal) {
+      const more = pickSpawns(batteryGoal - batteryPts.length, [...switchPts, ...batteryPts], 9)
+        .map((c) => jitter(c));
+      batteryPts.push(...more);
+    }
+    const batteries: Battery[] = batteryPts.slice(0, batteryGoal).map((p) => makeBattery(p.x, p.z));
 
     // ── Игрок: белый человечек с руками и ногами ───────────
     const player = new THREE.Group();
@@ -480,7 +673,46 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
     // ── Клавиатура ─────────────────────────────────────────
     const keys: Record<string, boolean> = {};
-    let mapView = false; // режим осмотра всей карты (клавиша M)
+    let mapView = false;     // режим осмотра всей карты (клавиша M)
+    let switchesActive = 0;  // сколько переключателей дёрнуто
+
+    // ── Сирена (синтез через WebAudio, без файла) ──────────
+    // Громкий воющий звук при активации переключателя.
+    let audioCtx: AudioContext | null = null;
+    const playSiren = () => {
+      try {
+        const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        audioCtx = audioCtx || new AC();
+        const ctx = audioCtx;
+        const t0 = ctx.currentTime, dur = 1.8;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sawtooth';
+        // вой вверх-вниз
+        for (let i = 0; i <= 3; i++) {
+          osc.frequency.setValueAtTime(i % 2 ? 1150 : 580, t0 + i * 0.45);
+          osc.frequency.linearRampToValueAtTime(i % 2 ? 580 : 1150, t0 + i * 0.45 + 0.45);
+        }
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(0.7, t0 + 0.04); // громко
+        gain.gain.setValueAtTime(0.7, t0 + dur - 0.15);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(t0); osc.stop(t0 + dur);
+      } catch { /* нет WebAudio */ }
+    };
+
+    // Проверка завершения уровня: ВСЕ батарейки доставлены И ВСЕ переключатели
+    // дёрнуты. Если батарейки готовы, а переключатель нет — уровень не пройден.
+    function tryComplete() {
+      if (finished) return;
+      if (collectedCount < batteryGoal || switchesActive < switchGoal) return;
+      finished = true;
+      try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
+      if (levelNum >= LEVELS) { setWon(true); }       // последний уровень → победа
+      else { setLevelCleared(true); }                  // иначе → экран «уровень пройден»
+    }
+
     const onKeyDown = (e: KeyboardEvent) => {
       if (!startedRef.current) return; // на меню клавиши игнорируются
       keys[e.code] = true;
@@ -491,6 +723,17 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       }
       if (e.code === 'KeyM') mapView = !mapView;
       if (e.code === 'KeyQ') dropFnRef.current?.(); // выбросить батарейку
+      if (e.code === 'KeyE') { // дёрнуть ближайший переключатель → сирена
+        for (const sw of switchesArr) {
+          if (sw.active) continue;
+          if (Math.hypot(sw.x - player.position.x, sw.z - player.position.z) < 3.4) {
+            sw.active = true; sw.setActive(true);
+            switchesActive++; setSwitchesOn(switchesActive);
+            playSiren(); tryComplete();
+            break;
+          }
+        }
+      }
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
     };
     const onKeyUp = (e: KeyboardEvent) => { keys[e.code] = false; };
@@ -564,12 +807,22 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       const raw = localStorage.getItem(SAVE_KEY);
       if (raw) {
         const sv = JSON.parse(raw) as {
-          collected?: number; carryingIndex?: number | null;
+          level?: number; collected?: number; carryingIndex?: number | null;
           player?: { x: number; z: number; face: number };
           batteries?: { x: number; z: number; delivered: boolean; carried: boolean }[];
+          switches?: boolean[];
         };
+        // сохранение от ДРУГОГО уровня (например только {level}) — спавн оставляем свежим
+        if ((sv.level ?? levelNum) === levelNum) {
         collectedCount = sv.collected ?? 0;
         setCollected(collectedCount);
+        if (Array.isArray(sv.switches)) {
+          sv.switches.forEach((on, i) => {
+            const sw = switchesArr[i];
+            if (sw && on) { sw.active = true; sw.setActive(true); switchesActive++; }
+          });
+          setSwitchesOn(switchesActive);
+        }
         if (sv.player) { player.position.set(sv.player.x, 0, sv.player.z); faceAngle = sv.player.face ?? 0; }
         if (Array.isArray(sv.batteries)) {
           sv.batteries.forEach((sb, i) => {
@@ -586,17 +839,20 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
             carrying.carried = true;
           }
         }
+        } // конец: сохранение того же уровня
       }
     } catch { /* нет localStorage или битое сохранение */ }
 
     // снимок текущего состояния для сохранения (вызывается из кнопок паузы)
     getStateRef.current = () => ({
+      level: levelNum,
       collected: collectedCount,
       carryingIndex: carrying ? batteries.indexOf(carrying) : null,
       player: { x: player.position.x, z: player.position.z, face: faceAngle },
       batteries: batteries.map((b) => ({
         x: b.group.position.x, z: b.group.position.z, delivered: b.delivered, carried: b.carried,
       })),
+      switches: switchesArr.map((s) => s.active),
     });
 
     function animate() {
@@ -641,11 +897,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           carrying = null;
           collectedCount++;
           setCollected(collectedCount);
-          if (collectedCount >= TOTAL_BATTERIES) {
-            finished = true;
-            setWon(true);
-            try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
-          }
+          tryComplete(); // все батарейки + все переключатели → следующий уровень / победа
         }
       } else {
         // подбор: если рядом лежит батарейка и руки свободны — берём.
@@ -684,6 +936,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
       if (mapView) {
         // ── Режим карты: вся темнота убрана, видно карту целиком ──
+        player.visible = true;
         ambient.intensity = 1.4;
         lantern.distance = 200;
         glow.distance = 200;
@@ -709,9 +962,19 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         glow.position.set(player.position.x, 2, player.position.z);
         glow.distance = Math.min(5.5, vision); // в тёмной зоне не больше обзора
 
-        // камера сверху, под небольшим углом
-        camera.position.set(player.position.x, 22, player.position.z + 11);
-        camera.lookAt(player.position.x, 0, player.position.z);
+        if (firstPersonRef.current) {
+          // ── От первого лица: камера в «глазах», смотрит по направлению взгляда ──
+          player.visible = false; // своё тело не загораживает обзор
+          const eyeH = 3.6;
+          const fx = Math.sin(faceAngle), fz = Math.cos(faceAngle);
+          camera.position.set(player.position.x + fx * 0.3, eyeH, player.position.z + fz * 0.3);
+          camera.lookAt(player.position.x + fx * 12, eyeH - 1.2, player.position.z + fz * 12);
+        } else {
+          // ── От третьего лица: камера сверху, под небольшим углом ──
+          player.visible = true;
+          camera.position.set(player.position.x, 22, player.position.z + 11);
+          camera.lookAt(player.position.x, 0, player.position.z);
+        }
       }
 
       renderer.render(scene, camera);
@@ -737,7 +1000,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       renderer.dispose();
       if (renderer.domElement.parentNode === mount) mount.removeChild(renderer.domElement);
     };
-  }, [runId]);
+  }, [runId, level]);
 
   return (
     <div style={{ position: 'fixed', inset: 0, width: '100vw', height: '100vh', overflow: 'hidden', background: '#05070a' }}>
@@ -751,17 +1014,50 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       {/* HUD — только в игре */}
       {started && (
         <>
-          {/* Счётчик собранных батареек — левый верхний угол */}
+          {/* Кнопка вида: от 1-го ↔ от 3-го лица (та же кнопка возвращает обратно) */}
+          <button
+            onClick={() => setFirstPerson((v) => !v)}
+            style={{
+              position: 'absolute', top: 12, right: 12,
+              padding: '10px 16px', fontSize: 15, fontWeight: 'bold', fontFamily: 'monospace',
+              background: firstPerson ? '#2bd24f' : 'rgba(255,255,255,0.14)',
+              color: firstPerson ? '#05140a' : '#fff',
+              border: '1px solid rgba(255,255,255,0.35)', borderRadius: 10, cursor: 'pointer',
+            }}
+          >
+            {firstPerson ? '👁 1-е лицо' : '🎥 3-е лицо'}
+          </button>
+
+          {/* Счётчики — левый верхний угол: уровень, батарейки, переключатели */}
           <div
             style={{
               position: 'absolute', top: 12, left: 12,
-              color: '#33ff66', fontSize: 30, fontWeight: 'bold',
+              fontSize: 30, fontWeight: 'bold',
               fontFamily: 'monospace', textShadow: '0 0 8px #000, 0 0 4px #000',
-              pointerEvents: 'none',
+              pointerEvents: 'none', display: 'flex', gap: 18, alignItems: 'center',
             }}
           >
-            🔋 {collected}/{TOTAL_BATTERIES}
+            <span style={{ color: '#9fd0ff' }}>УР {level}/{LEVELS}</span>
+            <span style={{ color: '#33ff66' }}>🔋 {collected}/{batteryCount}</span>
+            {switchCount > 0 && (
+              <span style={{ color: switchesOn >= switchCount ? '#33ff66' : '#ff5a3c' }}>
+                🚨 {switchesOn}/{switchCount}
+              </span>
+            )}
           </div>
+
+          {/* Все батарейки доставлены, но не все переключатели дёрнуты — напоминание */}
+          {switchCount > 0 && collected >= batteryCount && switchesOn < switchCount && (
+            <div
+              style={{
+                position: 'absolute', top: 60, left: 12,
+                color: '#ff5a3c', fontSize: 16, fontWeight: 'bold', fontFamily: 'monospace',
+                textShadow: '0 0 8px #000', pointerEvents: 'none',
+              }}
+            >
+              Дёрни все переключатели (E), чтобы пройти уровень!
+            </div>
+          )}
 
           {/* Подсказка управления — левый нижний угол */}
           <div
@@ -772,8 +1068,8 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
               pointerEvents: 'none', lineHeight: 1.5,
             }}
           >
-            <b>WASD</b> / стрелки — движение · <b>M</b> — вся карта · <b>Q</b> — выбросить · <b>Esc</b> — пауза<br />
-            Подбери батарейку (подойди к ней) и отнеси к красному генератору
+            <b>WASD</b> / стрелки — движение · <b>M</b> — вся карта · <b>Q</b> — выбросить{switchCount > 0 ? ' · ' : ''}{switchCount > 0 ? <b>E</b> : ''}{switchCount > 0 ? ' — переключатель' : ''} · <b>Esc</b> — пауза<br />
+            Подбери батарейку (подойди к ней) и отнеси к красному генератору{switchCount > 0 ? ', затем дёрни переключатели' : ''}
           </div>
         </>
       )}
@@ -807,6 +1103,39 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
             }}
           >
             ↺ Играть заново
+          </button>
+        </div>
+      )}
+
+      {/* Уровень пройден — переход на следующий уровень */}
+      {levelCleared && !won && (
+        <div
+          style={{
+            position: 'absolute', inset: 0,
+            display: 'flex', flexDirection: 'column', gap: 26,
+            alignItems: 'center', justifyContent: 'center',
+            background: 'rgba(0,0,0,0.7)', color: '#fff', fontFamily: 'monospace',
+          }}
+        >
+          <div
+            style={{
+              fontSize: 'min(11vw, 110px)', fontWeight: 'bold', letterSpacing: 4,
+              textShadow: '0 0 24px #33ff66, 0 0 48px #33ff66', textAlign: 'center',
+            }}
+          >
+            УРОВЕНЬ {level}<br />ПРОЙДЕН
+          </div>
+          <div style={{ fontSize: 18, opacity: 0.8 }}>Дальше будет сложнее…</div>
+          <button
+            onClick={nextLevel}
+            style={{
+              padding: '16px 40px', fontSize: 22, fontWeight: 'bold',
+              fontFamily: 'monospace', background: '#2bd24f', color: '#05140a',
+              border: 'none', borderRadius: 12, cursor: 'pointer',
+              boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+            }}
+          >
+            ▶ Уровень {Math.min(LEVELS, level + 1)}
           </button>
         </div>
       )}
