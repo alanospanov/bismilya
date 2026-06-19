@@ -9,7 +9,7 @@ type Rect = { minX: number; maxX: number; minZ: number; maxZ: number };
 type Battery = { group: THREE.Group; delivered: boolean; carried: boolean; locked: boolean };
 // Переключатель: меш + флаг активации + функция смены вида (красный↔зелёный)
 type Switch = { group: THREE.Group; x: number; z: number; active: boolean; setActive: (b: boolean) => void };
-const SAVE_KEY = 'spaidcan_save'; // ключ сохранённого прогресса в localStorage
+const SAVE_KEY = 'spaidcan_save_v2'; // ключ прогресса (v2 — сбрасываем старые сейвы, застрявшие на ур.6)
 const LEVELS = 6;                 // всего уровней
 
 // Конфиг уровня: чем дальше — тем больше батареек и рандома. Переключатели
@@ -41,6 +41,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   // Система уровней: текущий уровень, экран «уровень пройден», счётчики для HUD
   const [level, setLevel] = useState(initialLevel);
   const [levelCleared, setLevelCleared] = useState(false);
+  const [dead, setDead] = useState(false); // паук коснулся игрока → смерть
   const [batteryCount, setBatteryCount] = useState(() => levelConfig(initialLevel()).batteries);
   const [switchCount, setSwitchCount] = useState(0);
   const [switchesOn, setSwitchesOn] = useState(0);
@@ -54,6 +55,18 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   const getStateRef = useRef<(() => unknown) | undefined>(undefined); // снимок состояния для сохранения
   const audioRef = useRef<HTMLAudioElement | null>(null); // «лифтовая» музыка меню
   const [muted, setMuted] = useState(false);
+  // Громкость музыки (0..1), сохраняется между запусками; панель настроек
+  const VOL_KEY = 'spaidcan_volume';
+  const [volume, setVolume] = useState(() => {
+    try { const v = parseFloat(localStorage.getItem(VOL_KEY) ?? ''); if (!isNaN(v)) return Math.min(1, Math.max(0, v)); } catch { /* нет localStorage */ }
+    return 0.45;
+  });
+  const [showSettings, setShowSettings] = useState(false);
+  // применяем громкость к аудио сразу и запоминаем
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.volume = volume;
+    try { localStorage.setItem(VOL_KEY, String(volume)); } catch { /* нет localStorage */ }
+  }, [volume]);
   // Вид от первого лица (true) ↔ от третьего (false). Кнопка переключает туда-обратно.
   const [firstPerson, setFirstPerson] = useState(false);
   const firstPersonRef = useRef(false); // читается из игрового цикла
@@ -69,7 +82,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   const exitGame = () => { saveProgress(); resume(); setStarted(false); setExited(true); }; // выйти из игры
   const restart = () => {
     try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
-    resume(); setCollected(0); setWon(false); setLevelCleared(false);
+    resume(); setCollected(0); setWon(false); setLevelCleared(false); setDead(false);
     setSwitchesOn(0); setLevel(1); setBatteryCount(levelConfig(1).batteries); setSwitchCount(0);
     setRunId((r) => r + 1);
   };
@@ -78,7 +91,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   const nextLevel = () => {
     const nl = Math.min(LEVELS, level + 1);
     try { localStorage.setItem(SAVE_KEY, JSON.stringify({ level: nl })); } catch { /* нет localStorage */ }
-    resume(); setLevelCleared(false); setCollected(0); setSwitchesOn(0); setWon(false);
+    resume(); setLevelCleared(false); setCollected(0); setSwitchesOn(0); setWon(false); setDead(false);
     setLevel(nl); setRunId((r) => r + 1);
   };
   // Функция выброса батарейки — назначается внутри игрового цикла,
@@ -88,13 +101,26 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   // держим startedRef в синхроне со state (читается из игрового цикла)
   useEffect(() => { startedRef.current = started; }, [started]);
 
+  // После скримера (смерти от паука) — выброс обратно в меню
+  useEffect(() => {
+    if (!dead) return;
+    const t = setTimeout(() => {
+      try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
+      setDead(false); setStarted(false);
+      setCollected(0); setSwitchesOn(0); setLevel(1);
+      setBatteryCount(levelConfig(1).batteries); setSwitchCount(0);
+      setRunId((r) => r + 1); // пересоздать сцену с чистого листа
+    }, 2400);
+    return () => clearTimeout(t);
+  }, [dead]);
+
   // «лифтовая» музыка играет только на главном экране (меню)
   useEffect(() => {
     const a = audioRef.current;
     if (!a) return;
     const onMenu = !started && !exited && !muted;
     if (!onMenu) { a.pause(); return; }
-    a.volume = 0.45;
+    a.volume = volume;
     const tryPlay = () => { a.play().catch(() => { /* автоплей до жеста заблокирован */ }); };
     tryPlay();
     // если браузер заблокировал автоплей — запустить по первому действию пользователя
@@ -104,7 +130,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       window.removeEventListener('pointerdown', tryPlay);
       window.removeEventListener('keydown', tryPlay);
     };
-  }, [started, exited, muted]);
+  }, [started, exited, muted, volume]);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -115,9 +141,15 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     const cfg = levelConfig(levelNum);
     const batteryGoal = cfg.batteries;   // сколько батареек нужно доставить
     const switchGoal = cfg.switches;     // сколько переключателей нужно дёрнуть
+    // после 1-го уровня карта чуть-чуть растёт с каждым уровнем
+    const mapScale = 1 + (levelNum - 1) * 0.07; // L1=1.0 … L6≈1.35
+    const START_X = 9.5 * mapScale, START_Z = 0; // спавн игрока = центр центрального зала
+    // центральный квадрат (в нём НЕ спавним батарейки/переключатели), масштабируется
+    const CENTRAL = { minX: -5 * mapScale, maxX: 29 * mapScale, minZ: -10 * mapScale, maxZ: 10 * mapScale };
+    const inCentral = (x: number, z: number) => x >= CENTRAL.minX && x <= CENTRAL.maxX && z >= CENTRAL.minZ && z <= CENTRAL.maxZ;
     // сброс HUD под новый уровень (загрузка сохранения ниже может уточнить счётчики)
     setBatteryCount(batteryGoal); setSwitchCount(switchGoal);
-    setCollected(0); setSwitchesOn(0);
+    setCollected(0); setSwitchesOn(0); setDead(false);
 
     // ── Сцена / камера / рендерер ──────────────────────────
     const scene = new THREE.Scene();
@@ -312,7 +344,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       "        |     |                 |     |                      ",
       "        +-+-+-+                 +-+-+-+                      ",
     ];
-    const CW = 3.8; // ширина клетки в мире
+    const CW = 3.8 * mapScale; // ширина клетки в мире (растёт с уровнем)
     const cols = (MAP[0].length - 1) / 2;
     const rows = (MAP.length - 1) / 2;
     // координата символа схемы (lx,ly) → мир (полушаги, центр карты в нуле)
@@ -367,7 +399,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // Светящийся энергошар (как на скрине, но КРАСНЫЙ, без мелких линий —
     // только сфера-свечение). Вмонтирован заподлицо в верхнюю стену северной
     // комнаты (сплошная стена севернее зала, грань z=-16.85), не мигает.
-    const GEN_X = 9.5, GEN_Z = -17.9, GEN_Y = 2.0; // вдавлен в стену: наружу торчит только красный круг
+    const GEN_X = 9.5 * mapScale, GEN_Z = -17.9 * mapScale, GEN_Y = 2.0; // вдавлен в стену (масштаб карты)
     const generator = new THREE.Group();
     // красные оболочки свечения (аддитивные, без записи глубины — мягкий ореол)
     const genShell = (color: number, r: number, op: number) => {
@@ -419,7 +451,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       new THREE.CircleGeometry(0.85, 40),
       new THREE.MeshBasicMaterial({ color: 0xff0000 }),
     );
-    eyeDisc.position.set(GEN_X, GEN_Y, -16.84); // на южной грани стены, лицом в зал
+    eyeDisc.position.set(GEN_X, GEN_Y, -16.84 * mapScale); // на южной грани стены, лицом в зал
     scene.add(eyeDisc);
 
     // красное световое пятно на полу под генератором (отблеск его свечения)
@@ -439,7 +471,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       }),
     );
     floorGlow.rotation.x = -Math.PI / 2;
-    floorGlow.position.set(GEN_X, 0.03, GEN_Z + 3); // на полу, перед генератором (в зал)
+    floorGlow.position.set(GEN_X, 0.03, GEN_Z + 3 * mapScale); // на полу, перед генератором (в зал)
     scene.add(floorGlow);
 
     // коллизия — игрок не проходит сквозь генератор
@@ -453,8 +485,10 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // генератору; при касании коллизий батарейка исчезает (доставлена).
     function makeBattery(x: number, z: number): Battery {
       const g = new THREE.Group();
+      // Яркий emissive-материал: батарейка светится САМА (как объект), но НЕ
+      // освещает окружение — поэтому её свет не пробивается сквозь стены.
       const bodyMat = new THREE.MeshStandardMaterial({
-        color: 0x2bd24f, emissive: 0x16a030, emissiveIntensity: 0.9,
+        color: 0x2bd24f, emissive: 0x2bff55, emissiveIntensity: 1.6,
         metalness: 0.6, roughness: 0.3,
       });
       const capMat = new THREE.MeshStandardMaterial({
@@ -467,50 +501,76 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       // «+» полоска сверху, чтобы читалось как батарейка
       const band = new THREE.Mesh(
         new THREE.CylinderGeometry(0.285, 0.285, 0.1, 16),
-        new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xaaaaaa, emissiveIntensity: 0.4 }),
+        new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xaaaaaa, emissiveIntensity: 0.5 }),
       );
       band.position.y = 0.28;
       g.add(body, band, cap);
-      // личное свечение — батарейку видно в темноте издалека
-      const bl = new THREE.PointLight(0x33ff66, 5, 5, 2);
-      bl.position.y = 0.35;
-      g.add(bl);
       g.position.set(x, 0.55, z);
       scene.add(g);
       return { group: g, delivered: false, carried: false, locked: false };
     }
-    // ── Переключатель (сирена) ─────────────────────────────
-    // Стоит на месте — нести никуда не надо. Дёрнул (клавиша E рядом) → лампа
-    // краснея становится зелёной, рычаг откидывается, ревёт сирена. Пока не
-    // дёрнуты ВСЕ переключатели — на следующий уровень не пускает.
-    function makeSwitch(x: number, z: number): Switch {
+    // ── Переключатель = КНОПКА НА СТЕНЕ ────────────────────
+    // Никуда нести не надо: подходишь к стене и жмёшь E. Красная кнопка с
+    // подсветкой утоплена в панель на стене; при нажатии становится зелёной,
+    // вдавливается внутрь и ревёт сирена. Пока не нажаты ВСЕ — дальше нельзя.
+    // (x,z) — точка на грани стены; angle — наружу из стены (куда смотрит кнопка).
+    function makeSwitch(x: number, z: number, angle: number): Switch {
       const g = new THREE.Group();
-      const base = new THREE.Mesh(
-        new THREE.BoxGeometry(0.8, 1.5, 0.45),
-        new THREE.MeshStandardMaterial({ color: 0x2b2f37, metalness: 0.85, roughness: 0.4 }),
+      // монтажная панель, прижата к стене (в локальных координатах перед = +Z)
+      const plate = new THREE.Mesh(
+        new THREE.BoxGeometry(0.7, 0.7, 0.12),
+        new THREE.MeshStandardMaterial({ color: 0x2b2f37, metalness: 0.85, roughness: 0.45 }),
       );
-      base.position.y = 0.75; base.castShadow = true; base.receiveShadow = true;
-      const lampMat = new THREE.MeshStandardMaterial({ color: 0xff2200, emissive: 0xff1400, emissiveIntensity: 1.3 });
-      const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.22, 16, 16), lampMat);
-      lamp.position.y = 1.62;
-      const lever = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.07, 0.07, 0.62, 10),
-        new THREE.MeshStandardMaterial({ color: 0xe2e2e2, metalness: 0.9, roughness: 0.3 }),
-      );
-      lever.position.set(0, 1.05, 0.28); lever.rotation.x = 0.7;
-      const light = new THREE.PointLight(0xff2200, 5, 7, 2); light.position.y = 1.62;
-      g.add(base, lamp, lever, light);
-      g.position.set(x, 0, z);
+      plate.position.z = 0.06; plate.castShadow = true; plate.receiveShadow = true;
+      // ободок-подсветка вокруг кнопки
+      const ringMat = new THREE.MeshStandardMaterial({ color: 0x551111, emissive: 0xff1400, emissiveIntensity: 1.1 });
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.26, 0.04, 10, 24), ringMat);
+      ring.position.z = 0.13;
+      // сама кнопка — короткий цилиндр, лежит вдоль +Z (нажимается внутрь)
+      const btnMat = new THREE.MeshStandardMaterial({ color: 0xff2a14, emissive: 0xff1400, emissiveIntensity: 1.4, metalness: 0.3, roughness: 0.4 });
+      const button = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 0.16, 24), btnMat);
+      button.rotation.x = Math.PI / 2; // ось цилиндра -> вдоль Z
+      button.position.z = 0.16;
+      const light = new THREE.PointLight(0xff2200, 4, 5, 2); light.position.z = 0.4;
+      g.add(plate, ring, button, light);
+      g.position.set(x, 1.55, z);  // на высоте руки
+      g.rotation.y = angle;        // лицом наружу из стены
       scene.add(g);
-      // переключатель — препятствие (нельзя пройти насквозь)
-      colliders.push({ minX: x - 0.5, maxX: x + 0.5, minZ: z - 0.3, maxZ: z + 0.3 });
       const setActive = (b: boolean) => {
-        lampMat.color.set(b ? 0x33ff66 : 0xff2200);
-        lampMat.emissive.set(b ? 0x22ff44 : 0xff1400);
-        light.color.set(b ? 0x33ff66 : 0xff2200);
-        lever.rotation.x = b ? -0.7 : 0.7;
+        const c = b ? 0x22ff44 : 0xff1400;
+        btnMat.color.set(b ? 0x2bd24f : 0xff2a14);
+        btnMat.emissive.set(c); ringMat.emissive.set(c); light.color.set(b ? 0x33ff66 : 0xff2200);
+        button.position.z = b ? 0.08 : 0.16; // нажата → вдавлена
       };
       return { group: g, x, z, active: false, setActive };
+    }
+
+    // Подобрать точку на ближайшей стене для монтажа кнопки рядом с точкой (px,pz).
+    // Возвращает позицию на грани стены + угол наружу (в сторону открытого прохода).
+    function mountOnWall(px: number, pz: number): { x: number; z: number; angle: number } {
+      let best: Rect | null = null, bestD = Infinity;
+      for (const b of colliders) {
+        if (b === genRect) continue;
+        const cx = Math.max(b.minX, Math.min(px, b.maxX));
+        const cz = Math.max(b.minZ, Math.min(pz, b.maxZ));
+        const d = Math.hypot(px - cx, pz - cz);
+        if (d < bestD) { bestD = d; best = b; }
+      }
+      if (!best) return { x: px, z: pz, angle: 0 };
+      const sxw = best.maxX - best.minX, szw = best.maxZ - best.minZ;
+      const midX = (best.minX + best.maxX) / 2, midZ = (best.minZ + best.maxZ) / 2;
+      const OFF = 0.16; // кнопка чуть выступает из грани
+      if (sxw <= szw) { // вертикальная стена (тонкая по X), грани по ±X
+        const pos = px > midX, sign = pos ? 1 : -1;
+        const faceX = pos ? best.maxX : best.minX;
+        const z = Math.min(best.maxZ - 0.4, Math.max(best.minZ + 0.4, pz));
+        return { x: faceX + sign * OFF, z, angle: sign > 0 ? Math.PI / 2 : -Math.PI / 2 };
+      } else { // горизонтальная стена (тонкая по Z), грани по ±Z
+        const pos = pz > midZ, sign = pos ? 1 : -1;
+        const faceZ = pos ? best.maxZ : best.minZ;
+        const x = Math.min(best.maxX - 0.4, Math.max(best.minX + 0.4, px));
+        return { x, z: faceZ + sign * OFF, angle: sign > 0 ? 0 : Math.PI };
+      }
     }
 
     // ── Достижимость карты (флуд-фолл по сетке) ─────────────
@@ -533,7 +593,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       const reach: { x: number; z: number }[] = [];
       const seen = new Set<string>();
       const key = (ix: number, iz: number) => ix + '|' + iz;
-      const sIx = Math.round(9.5 / STEP), sIz = 0; // стартовая клетка = спавн игрока
+      const sIx = Math.round(START_X / STEP), sIz = Math.round(START_Z / STEP); // стартовая клетка = спавн игрока
       const queue: [number, number][] = [[sIx, sIz]];
       seen.add(key(sIx, sIz));
       while (queue.length) {
@@ -563,7 +623,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       if (count <= 0) return;
       const reach1 = computeReach();
       const cand = shuffle(reach1.filter((c) =>
-        Math.abs(c.x) > 22 && clearAt(c.x, c.z) >= 1.7 && Math.abs(c.z) < 13,
+        Math.abs(c.x) > 22 * mapScale && !inCentral(c.x, c.z) && clearAt(c.x, c.z) >= 1.7 && Math.abs(c.z) < 13 * mapScale,
       ));
       const D = 2.2, T2 = TH;
       for (const c of cand) {
@@ -584,7 +644,8 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     function pickSpawns(n: number, avoid: { x: number; z: number }[], minSep: number) {
       const pool = shuffle(reach.filter((c) =>
         clearAt(c.x, c.z) >= 1.45 &&
-        Math.hypot(c.x - 9.5, c.z - 0) > 7 &&                 // не у самого спавна
+        !inCentral(c.x, c.z) &&                               // не в центральном зале
+        Math.hypot(c.x - START_X, c.z - START_Z) > 7 &&       // не у самого спавна
         Math.hypot(c.x - GEN_X, c.z - GEN_Z) > 5,             // не у генератора
       ));
       const chosen: { x: number; z: number }[] = [];
@@ -617,7 +678,11 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     if (switchPts.length < switchGoal) {
       switchPts.push(...pickSpawns(switchGoal - switchPts.length, switchPts, 12));
     }
-    const switchesArr: Switch[] = switchPts.slice(0, switchGoal).map((p) => makeSwitch(p.x, p.z));
+    // каждую точку «прижимаем» к ближайшей стене → кнопка на стене
+    const switchesArr: Switch[] = switchPts.slice(0, switchGoal).map((p) => {
+      const m = mountOnWall(p.x, p.z);
+      return makeSwitch(m.x, m.z, m.angle);
+    });
 
     // ── Раскладка батареек ─────────────────────────────────
     // В альковах рядом с переключателем тоже кладём батарейку, остальные — по карте.
@@ -652,6 +717,26 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     head.position.y = 2.05;
     player.add(torso, head);
 
+    // ── Лицо (на передней стороне головы, +z — куда смотрит игрок) ──
+    const faceMat = new THREE.MeshStandardMaterial({
+      color: 0x111318, emissive: 0x000000, roughness: 0.5, metalness: 0,
+    });
+    const eyeGeo = new THREE.SphereGeometry(0.07, 12, 12);
+    const leftEye = new THREE.Mesh(eyeGeo, faceMat);
+    leftEye.position.set(-0.12, 0.06, 0.30);
+    const rightEye = new THREE.Mesh(eyeGeo, faceMat);
+    rightEye.position.set(0.12, 0.06, 0.30);
+    // блик в глазах — маленькие белые точки, «живой» взгляд
+    const shineMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.8 });
+    const shineGeo = new THREE.SphereGeometry(0.025, 8, 8);
+    const lShine = new THREE.Mesh(shineGeo, shineMat); lShine.position.set(-0.10, 0.09, 0.355);
+    const rShine = new THREE.Mesh(shineGeo, shineMat); rShine.position.set(0.14, 0.09, 0.355);
+    // улыбка — половинка тора, изгиб вниз
+    const mouth = new THREE.Mesh(new THREE.TorusGeometry(0.1, 0.022, 8, 16, Math.PI), faceMat);
+    mouth.position.set(0, -0.07, 0.30);
+    mouth.rotation.z = Math.PI; // дуга изгибается вниз → улыбка
+    head.add(leftEye, rightEye, lShine, rShine, mouth);
+
     // конечность: группа с пивотом в плече/бедре, меш свисает вниз
     function makeLimb(px: number, py: number, len: number, rad: number) {
       const g = new THREE.Group();
@@ -667,9 +752,153 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     const leftLeg = makeLimb(-0.18, 0.85, 0.55, 0.14);
     const rightLeg = makeLimb(0.18, 0.85, 0.55, 0.14);
 
-    player.position.set(9.5, 0, 0); // старт — ровно в центре центрального квадратного зала
+    player.position.set(START_X, 0, START_Z); // старт — ровно в центре центрального квадратного зала
     player.scale.setScalar(2);      // игрок в 2 раза больше (хитбокс — PLAYER_R ниже)
     scene.add(player);
+
+    // ── Гигантский паук (только 1-й уровень) ───────────────
+    // Слепой и глухой: НИКАК не реагирует на игрока, просто бесконечно ползёт
+    // по периметру вдоль стен внутри карты (за карту не выходит).
+    type SpiderLeg = { legG: THREE.Group; fem: THREE.Group; baseY: number; baseFemur: number; side: number; phase: number };
+    let spider: { group: THREE.Group; legs: SpiderLeg[]; touchR: number } | null = null;
+    let spiderD = 0; // пройденный путь по периметру
+    // Паук кружит вдоль стен ЦЕНТРАЛЬНОГО зала (где стоит игрок) — так его видно
+    // и он реально опасен. За карту/зал не выходит.
+    function spiderPath(d: number) {
+      const x0 = CENTRAL.minX + 2, x1 = CENTRAL.maxX - 2, z0 = CENTRAL.minZ + 2, z1 = CENTRAL.maxZ - 2;
+      const w = Math.max(1, x1 - x0), h = Math.max(1, z1 - z0);
+      const P = 2 * (w + h);
+      let t = ((d % P) + P) % P;
+      if (t < w) return { x: x0 + t, z: z0, dir: [1, 0] as const };
+      t -= w; if (t < h) return { x: x1, z: z0 + t, dir: [0, 1] as const };
+      t -= h; if (t < w) return { x: x1 - t, z: z1, dir: [-1, 0] as const };
+      t -= h; return { x: x0, z: z1 - t, dir: [0, -1] as const };
+    }
+    function buildSpider() {
+      // Ширина тела = ширина прохода коридора (≈ CW − TH), чтобы паук идеально
+      // проходил в выход из центрального квадрата. По длине тело может быть больше.
+      const bodyR = (CW - TH) / 2 * 0.97; // полуширина ≈ половина прохода
+      const diameter = bodyR * 2;
+      const legLen = diameter * 1.8;      // длинные лапки
+      // глянцевый металлически-красный (как на референсе)
+      const redBody = new THREE.MeshStandardMaterial({ color: 0xc8160c, emissive: 0x2c0402, emissiveIntensity: 0.35, metalness: 0.85, roughness: 0.18, envMapIntensity: 1.1 });
+      const redLeg = new THREE.MeshStandardMaterial({ color: 0xb01608, emissive: 0x1e0301, emissiveIntensity: 0.35, metalness: 0.55, roughness: 0.4, envMapIntensity: 0.8 });
+      const footMat = new THREE.MeshStandardMaterial({ color: 0x240a05, roughness: 0.75, metalness: 0.2 }); // тёмные кончики
+      const eyeMat = new THREE.MeshStandardMaterial({ color: 0x050506, metalness: 0.1, roughness: 0.05 }); // чёрные блестящие глаза
+      const shineMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.9 });
+      const hairMat = new THREE.MeshStandardMaterial({ color: 0x160604, roughness: 0.95, metalness: 0.05 });
+      const s = new THREE.Group();
+
+      // ── Волоски (детализация) ──────────────────────────────
+      // Единичный конус-волосок масштабируем по длине; ориентируем вдоль нормали.
+      const hairGeo = new THREE.ConeGeometry(0.5, 1, 4);
+      const UP = new THREE.Vector3(0, 1, 0);
+      const addHair = (parent: THREE.Object3D, px: number, py: number, pz: number, nx: number, ny: number, nz: number, len: number, thick: number) => {
+        const n = new THREE.Vector3(nx, ny, nz).normalize();
+        const h = new THREE.Mesh(hairGeo, hairMat);
+        h.scale.set(thick, len, thick);
+        h.quaternion.setFromUnitVectors(UP, n);
+        h.position.set(px, py, pz).addScaledVector(n, len * 0.5);
+        parent.add(h);
+      };
+      // опушка по эллипсоиду тела: волоски торчат наружу (и чуть вверх)
+      const furSphere = (cx: number, cy: number, cz: number, r: number, sc: THREE.Vector3, count: number, len: number, thick: number) => {
+        for (let k = 0; k < count; k++) {
+          const u = Math.random(), v = Math.random();
+          const th = 2 * Math.PI * u, ph = Math.acos(2 * v - 1);
+          const nx = Math.sin(ph) * Math.cos(th), ny = Math.cos(ph), nz = Math.sin(ph) * Math.sin(th);
+          addHair(s, cx + nx * r * sc.x, cy + ny * r * sc.y, cz + nz * r * sc.z, nx, ny * 0.6 + 0.4, nz, len, thick);
+        }
+      };
+      // опушка вдоль кости (сегмента ноги): волоски по бокам, наружу и вверх
+      const furSeg = (segG: THREE.Object3D, segLen: number, rows: number, len: number, thick: number) => {
+        for (let r = 0; r < rows; r++) {
+          const y = segLen * (0.18 + 0.64 * (rows === 1 ? 0.5 : r / (rows - 1)));
+          for (const [dx, dz] of [[1, 0.35], [-1, 0.35], [0.35, 1], [0.35, -1]] as const) {
+            addHair(segG, 0, y, 0, dx, 0.55, dz, len, thick);
+          }
+        }
+      };
+
+      // ── Тело: головогрудь (перед, +Z) + брюшко (зад) — поджарое, не «жирное» ──
+      const cephalo = new THREE.Mesh(new THREE.SphereGeometry(bodyR * 0.62, 28, 20), redBody);
+      cephalo.position.set(0, 0, bodyR * 0.5); cephalo.scale.set(0.92, 0.62, 1.0); cephalo.castShadow = true;
+      const abdomen = new THREE.Mesh(new THREE.SphereGeometry(bodyR * 0.72, 30, 24), redBody);
+      abdomen.position.set(0, bodyR * 0.08, -bodyR * 0.75); abdomen.scale.set(0.82, 0.72, 1.3); abdomen.castShadow = true;
+      s.add(cephalo, abdomen);
+      // опушка тела — много тонких волосков (детализация как на фото)
+      furSphere(abdomen.position.x, abdomen.position.y, abdomen.position.z, bodyR * 0.72, abdomen.scale, 70, bodyR * 0.3, bodyR * 0.014);
+      furSphere(cephalo.position.x, cephalo.position.y, cephalo.position.z, bodyR * 0.62, cephalo.scale, 34, bodyR * 0.2, bodyR * 0.012);
+      // хелицеры + мохнатый «рот» снизу спереди (как на фото — тёмный, волосатый)
+      const mouth = new THREE.Mesh(new THREE.SphereGeometry(bodyR * 0.22, 16, 12), hairMat);
+      mouth.position.set(0, -bodyR * 0.26, bodyR * 0.92); mouth.scale.set(1, 0.9, 0.7); s.add(mouth);
+      for (const fx of [-1, 1]) {
+        const fang = new THREE.Mesh(new THREE.ConeGeometry(bodyR * 0.07, bodyR * 0.28, 8), footMat);
+        fang.position.set(fx * bodyR * 0.14, -bodyR * 0.42, bodyR * 0.92); fang.rotation.x = Math.PI * 0.92;
+        s.add(fang);
+      }
+      // ── Глаза кучкой спереди (паук всё равно слепой — для вида) ──
+      // 2 больших передних + 2 средних сверху + 2 маленьких по бокам.
+      const eyeFront = bodyR * 1.0;
+      const addEye = (ex: number, ey: number, r: number) => {
+        const eye = new THREE.Mesh(new THREE.SphereGeometry(r, 14, 14), eyeMat);
+        eye.position.set(ex, ey, eyeFront - (bodyR - r) * 0.15); s.add(eye);
+        const sh = new THREE.Mesh(new THREE.SphereGeometry(r * 0.28, 8, 8), shineMat);
+        sh.position.set(ex - r * 0.35, ey + r * 0.4, eyeFront + r * 0.8 - (bodyR - r) * 0.15); s.add(sh);
+      };
+      addEye(-bodyR * 0.2, -bodyR * 0.02, bodyR * 0.17);  // большие передние
+      addEye(bodyR * 0.2, -bodyR * 0.02, bodyR * 0.17);
+      addEye(-bodyR * 0.18, bodyR * 0.28, bodyR * 0.11);  // средние сверху
+      addEye(bodyR * 0.18, bodyR * 0.28, bodyR * 0.11);
+      addEye(-bodyR * 0.42, bodyR * 0.14, bodyR * 0.08);  // маленькие по бокам
+      addEye(bodyR * 0.42, bodyR * 0.14, bodyR * 0.08);
+
+      // ── Реалистичная нога: бедро вверх-наружу к приподнятому колену,
+      //    затем голень вниз-наружу к полу; сегменты сужаются, тёмный кончик + волоски. ──
+      const boneZ = (len: number, rT: number, rB: number, angleZ: number, mat: THREE.Material) => {
+        const g = new THREE.Group(); g.rotation.z = angleZ;
+        const m = new THREE.Mesh(new THREE.CylinderGeometry(rT, rB, len, 8), mat);
+        m.position.y = len / 2; m.castShadow = true; g.add(m);
+        const tip = new THREE.Group(); tip.position.y = len; g.add(tip);
+        return { g, tip };
+      };
+      const upAngle = 0.55;                 // наклон бедра от вертикали (вверх-наружу)
+      const downExtra = 0.35;               // доворот голени вниз за колено
+      const femurLen = legLen * 0.5, tibiaLen = legLen * 0.8;
+      const kneeY = Math.cos(upAngle) * femurLen;
+      const footY = kneeY - Math.cos(downExtra) * tibiaLen; // y ступни относительно тела (<0)
+
+      const legs: SpiderLeg[] = [];
+      for (const side of [-1, 1]) for (let i = 0; i < 4; i++) {
+        const legG = new THREE.Group();
+        const zOff = (i - 1.5) * (bodyR * 0.5);
+        legG.position.set(side * bodyR * 0.55, bodyR * 0.1, zOff);
+        const femurAngle = -side * upAngle;                     // бедро вверх-наружу
+        const fem = boneZ(femurLen, legLen * 0.04, legLen * 0.06, femurAngle, redLeg);
+        const tibiaWorld = -side * (Math.PI - downExtra);       // голень вниз-наружу
+        const tib = boneZ(tibiaLen, legLen * 0.018, legLen * 0.038, tibiaWorld - femurAngle, redLeg);
+        // тёмный кончик-лапка
+        const foot = new THREE.Mesh(new THREE.CylinderGeometry(legLen * 0.018, legLen * 0.008, legLen * 0.16, 6), footMat);
+        foot.position.y = legLen * 0.08; foot.castShadow = true; tib.tip.add(foot);
+        // густые волоски на бедре и голени
+        furSeg(fem.g, femurLen, 2, legLen * 0.1, legLen * 0.006);
+        furSeg(tib.g, tibiaLen, 3, legLen * 0.11, legLen * 0.005);
+        fem.tip.add(tib.g); legG.add(fem.g);
+        const baseY = side > 0 ? (-0.7 + i * 0.47) : (0.7 - i * 0.47); // веер передних/задних ног
+        legG.rotation.y = baseY;
+        s.add(legG);
+        // фазы чередуются (переменный «тетрапод»): соседние ноги в противофазе
+        const phase = ((i + (side > 0 ? 1 : 0)) % 2) * Math.PI;
+        legs.push({ legG, fem: fem.g, baseY, baseFemur: femurAngle, side, phase });
+      }
+      s.position.y = -footY + 0.05; // ступни ровно на полу
+      scene.add(s);
+      return { group: s, legs, touchR: bodyR }; // радиус касания тела (+ радиус игрока в проверке)
+    }
+    if (levelNum === 1) {
+      spider = buildSpider();
+      spiderD = (maxWX - minWX) * 0.4; // стартует не в углу
+    }
 
     // ── Клавиатура ─────────────────────────────────────────
     const keys: Record<string, boolean> = {};
@@ -699,6 +928,39 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
         osc.connect(gain).connect(ctx.destination);
         osc.start(t0); osc.stop(t0 + dur);
+      } catch { /* нет WebAudio */ }
+    };
+
+    // ── Звук скримера: резкий диссонансный визг + шум ──────
+    const playScream = () => {
+      try {
+        const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        audioCtx = audioCtx || new AC();
+        const ctx = audioCtx;
+        if (ctx.state === 'suspended') ctx.resume();
+        const t0 = ctx.currentTime, dur = 1.6;
+        // шумовой всплеск (затухающий)
+        const n = Math.floor(ctx.sampleRate * dur);
+        const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 0.5);
+        const noise = ctx.createBufferSource(); noise.buffer = buf;
+        const nGain = ctx.createGain(); nGain.gain.value = 0.45;
+        noise.connect(nGain).connect(ctx.destination);
+        // диссонансные пилы, скользящие вниз
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.85, t0 + 0.02); // очень громко, мгновенно
+        g.gain.setValueAtTime(0.85, t0 + dur - 0.25);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        g.connect(ctx.destination);
+        for (const f of [180, 196, 466, 933, 1400]) {
+          const o = ctx.createOscillator(); o.type = 'sawtooth';
+          o.frequency.setValueAtTime(f, t0);
+          o.frequency.linearRampToValueAtTime(f * 0.45, t0 + dur);
+          o.connect(g); o.start(t0); o.stop(t0 + dur);
+        }
+        noise.start(t0); noise.stop(t0 + dur);
       } catch { /* нет WebAudio */ }
     };
 
@@ -798,6 +1060,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     };
     dropFnRef.current = drop;
     let finished = false; // победа достигнута (Escape больше не ставит на паузу)
+    let deadFlag = false;  // паук коснулся игрока — сцена замораживается
     pausedRef.current = false;
 
     // ── Загрузка сохранённого прогресса ────────────────────
@@ -859,6 +1122,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       frameId = requestAnimationFrame(animate);
       const dt = Math.min(clock.getDelta(), 0.05);
       if (pausedRef.current) { renderer.render(scene, camera); return; } // на паузе — заморозка
+      if (deadFlag) { renderer.render(scene, camera); return; }          // смерть — заморозка
 
       const speed = carrying ? 5 * 0.67 : 5; // с батарейкой на 33% медленнее
       let mx = (keys['KeyD'] || keys['ArrowRight'] ? 1 : 0) - (keys['KeyA'] || keys['ArrowLeft'] ? 1 : 0);
@@ -933,6 +1197,34 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       rightLeg.rotation.x = s * legAmp;
       // лёгкое покачивание корпуса при ходьбе
       player.position.y = Math.abs(Math.sin(walkPhase)) * 0.06 * walkAmt;
+
+      // ── Паук: бесконечный обход периметра (слепой/глухой, игрока не видит) ──
+      if (spider) {
+        spiderD += dt * 6; // скорость ползания
+        const p = spiderPath(spiderD);
+        // тело строго внутри карты — за карту не выходит
+        spider.group.position.x = Math.min(maxWX - 1, Math.max(minWX + 1, p.x));
+        spider.group.position.z = Math.min(maxWZ - 1, Math.max(minWZ + 1, p.z));
+        spider.group.rotation.y = Math.atan2(p.dir[0], p.dir[1]); // мордой по ходу
+        // Реалистичная походка: ноги в противофазе (переменный тетрапод).
+        // В фазе переноса нога идёт вперёд И приподнимается, в опорной — назад на полу.
+        const gait = spiderD * 1.1;
+        for (const L of spider.legs) {
+          const ph = gait + L.phase;
+          L.legG.rotation.y = L.baseY + Math.sin(ph) * 0.3;            // мах вперёд/назад
+          const lift = Math.max(0, Math.cos(ph));                      // подъём в фазе переноса
+          L.fem.rotation.z = L.baseFemur + L.side * lift * 0.5;        // поднять лапу над полом
+        }
+        // касание игрока → смерть (👎)
+        if (!finished) {
+          const ddx = spider.group.position.x - player.position.x;
+          const ddz = spider.group.position.z - player.position.z;
+          const reach = spider.touchR + PLAYER_R + 0.8; // тело + игрок + немного на лапы
+          if (ddx * ddx + ddz * ddz < reach * reach) {
+            deadFlag = true; finished = true; setDead(true); playScream();
+          }
+        }
+      }
 
       if (mapView) {
         // ── Режим карты: вся темнота убрана, видно карту целиком ──
@@ -1070,6 +1362,68 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           >
             <b>WASD</b> / стрелки — движение · <b>M</b> — вся карта · <b>Q</b> — выбросить{switchCount > 0 ? ' · ' : ''}{switchCount > 0 ? <b>E</b> : ''}{switchCount > 0 ? ' — переключатель' : ''} · <b>Esc</b> — пауза<br />
             Подбери батарейку (подойди к ней) и отнеси к красному генератору{switchCount > 0 ? ', затем дёрни переключатели' : ''}
+          </div>
+        </>
+      )}
+
+      {/* Скример: морда паука влетает на весь экран, тряска, вспышки → потом меню */}
+      {dead && (
+        <>
+          <style>{`
+            @keyframes scr-zoom {
+              0%   { transform: scale(0.05) rotate(-8deg); opacity: 0; }
+              12%  { transform: scale(1.2) rotate(3deg); opacity: 1; }
+              100% { transform: scale(2.9) rotate(-2deg); opacity: 1; }
+            }
+            @keyframes scr-shake {
+              0%,100% { transform: translate(0,0); }
+              20% { transform: translate(-18px, 12px); }
+              40% { transform: translate(16px, -14px); }
+              60% { transform: translate(-14px, -10px); }
+              80% { transform: translate(12px, 14px); }
+            }
+            @keyframes scr-flash {
+              0%,100% { background: #000; }
+              50% { background: #5e0000; }
+            }
+            @keyframes scr-dislike {
+              0%,60% { opacity: 0; transform: scale(0.3); }
+              75% { opacity: 1; transform: scale(1.25); }
+              100% { opacity: 1; transform: scale(1); }
+            }
+          `}</style>
+          <div
+            style={{
+              position: 'absolute', inset: 0, zIndex: 50, overflow: 'hidden',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              animation: 'scr-flash 0.12s steps(1) infinite',
+            }}
+          >
+            {/* тряска-обёртка */}
+            <div style={{ position: 'absolute', inset: '-10%', animation: 'scr-shake 0.09s infinite' }}>
+              <img
+                src="/spider-face.jpg"
+                alt=""
+                style={{
+                  position: 'absolute', top: '50%', left: '50%', marginLeft: '-35vmin', marginTop: '-35vmin',
+                  width: '70vmin', height: '70vmin', objectFit: 'cover', borderRadius: '50%',
+                  // окрас «в красное» как у паука + жуткое свечение
+                  filter: 'grayscale(1) sepia(1) saturate(7) hue-rotate(-35deg) brightness(1.05) contrast(1.2)',
+                  boxShadow: '0 0 120px 40px rgba(190,20,10,0.85)',
+                  transformOrigin: 'center',
+                  animation: 'scr-zoom 1.1s ease-in forwards',
+                }}
+              />
+            </div>
+            {/* дизлайк поверх в конце */}
+            <div
+              style={{
+                position: 'relative', zIndex: 2, fontSize: 'min(30vw, 260px)', lineHeight: 1,
+                filter: 'drop-shadow(0 0 30px #000)', animation: 'scr-dislike 1.6s ease-out forwards',
+              }}
+            >
+              👎
+            </div>
           </div>
         </>
       )}
@@ -1233,7 +1587,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
           {/* Кнопка «Настройки» — прямо под «Играть» */}
           <button
-            onClick={() => { /* пока ничего */ }}
+            onClick={() => setShowSettings(true)}
             style={{
               position: 'absolute', top: 'calc(50% + 58px)', left: '8%',
               padding: '14px 36px', fontSize: 18, fontWeight: 'bold', fontFamily: 'monospace',
@@ -1243,6 +1597,64 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           >
             ⚙ Настройки
           </button>
+
+          {/* Панель настроек — громкость музыки */}
+          {showSettings && (
+            <div
+              onClick={() => setShowSettings(false)}
+              style={{
+                position: 'absolute', inset: 0, display: 'flex',
+                alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(0,0,0,0.6)', zIndex: 10,
+              }}
+            >
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  width: 'min(90vw, 420px)', padding: '28px 32px',
+                  background: '#0d1119', color: '#fff', fontFamily: 'monospace',
+                  border: '1px solid rgba(255,255,255,0.25)', borderRadius: 16,
+                  boxShadow: '0 8px 40px rgba(0,0,0,0.6)',
+                  display: 'flex', flexDirection: 'column', gap: 22,
+                }}
+              >
+                <div style={{ fontSize: 26, fontWeight: 'bold', letterSpacing: 3 }}>⚙ Настройки</div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 16 }}>
+                    <span>🎵 Громкость музыки</span>
+                    <span style={{ color: '#33ff66', fontWeight: 'bold' }}>{Math.round(volume * 100)}%</span>
+                  </div>
+                  <input
+                    type="range" min={0} max={1} step={0.01} value={volume}
+                    onChange={(e) => { setVolume(parseFloat(e.target.value)); if (muted) setMuted(false); }}
+                    style={{ width: '100%', accentColor: '#2bd24f', cursor: 'pointer' }}
+                  />
+                  <button
+                    onClick={() => setMuted((m) => !m)}
+                    style={{
+                      alignSelf: 'flex-start', marginTop: 4, padding: '8px 16px', fontSize: 14,
+                      fontFamily: 'monospace', fontWeight: 'bold',
+                      background: muted ? '#c0392b' : 'rgba(255,255,255,0.14)', color: '#fff',
+                      border: '1px solid rgba(255,255,255,0.3)', borderRadius: 10, cursor: 'pointer',
+                    }}
+                  >
+                    {muted ? '🔇 Музыка выключена' : '🔊 Музыка включена'}
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => setShowSettings(false)}
+                  style={{
+                    padding: '12px 0', fontSize: 18, fontWeight: 'bold', fontFamily: 'monospace',
+                    background: '#2bd24f', color: '#05140a', border: 'none', borderRadius: 12, cursor: 'pointer',
+                  }}
+                >
+                  Готово
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Кнопка «Выйти» — маленькая, в левом верхнем углу */}
           <button
