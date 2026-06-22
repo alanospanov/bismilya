@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
+import { supabase } from '../lib/supabase';
 
 // Прямоугольник на плоскости XZ (стена или зона)
 type Rect = { minX: number; maxX: number; minZ: number; maxZ: number };
@@ -9,6 +10,8 @@ type Rect = { minX: number; maxX: number; minZ: number; maxZ: number };
 type Battery = { group: THREE.Group; delivered: boolean; carried: boolean; locked: boolean };
 // Переключатель: меш + флаг активации + функция смены вида (красный↔зелёный)
 type Switch = { group: THREE.Group; x: number; z: number; active: boolean; setActive: (b: boolean) => void };
+// Мясо: лежит на карте, восстанавливает сытость при подборе
+type Meat = { group: THREE.Group; eaten: boolean };
 const SAVE_KEY = 'spaidcan_save_v2'; // ключ прогресса (v2 — сбрасываем старые сейвы, застрявшие на ур.6)
 const LEVELS = 6;                 // всего уровней
 
@@ -19,9 +22,66 @@ function levelConfig(level: number) {
   return {
     batteries: 2 + lv,                              // L1=3 … L6=8
     randomness: Math.min(1, 0.12 + (lv - 1) * 0.18), // разброс спавна растёт
-    switches: lv >= 4 ? lv - 3 : 0,                 // L4=1, L5=2, L6=3
+    switches: lv >= 3 ? lv - 2 : 0,                 // L3=1, L4=2, L5=3, L6=4
     alcoves: lv >= 5 ? lv - 4 : 0,                  // L5=1, L6=2 (чуть-чуть выступов)
   };
+}
+
+// ── Способности паука по уровням (накопительно) ──────────
+// Перед каждым уровнем показываем заголовок «SPAID CAN <список>». На 1-м уровне
+// паук умеет ТОЛЬКО двигаться, дальше каждый уровень добавляет одну способность —
+// и каждая бьёт по конкретной тактике игрока (см. поле ru / counter).
+const SPIDER_ABILITIES = [
+  { key: 'move',  en: 'MOVE',       ru: 'двигаться' },
+  { key: 'hear',  en: 'HEAR',       ru: 'СЛЫШАТЬ — идёт на шум твоих шагов (стой на месте, чтобы не услышал)' },
+  { key: 'see',   en: 'SEE',        ru: 'ВИДЕТЬ — рвётся к тебе на прямой видимости (прячься за стены)' },
+  { key: 'smell', en: 'SMELL',      ru: 'НЮХАТЬ — идёт по следу запаха сквозь стены (петляй и сбивай след)' },
+  { key: 'web',   en: 'SHOOT WEBS', ru: 'СТРЕЛЯТЬ ПАУТИНОЙ — замедляет тебя (разрывай линию видимости)' },
+  { key: 'clone', en: 'CLONE',      ru: 'КЛОНИРОВАТЬСЯ — появляются ещё пауки (не загоняй себя в угол)' },
+] as const;
+type AbilityKey = (typeof SPIDER_ABILITIES)[number]['key'];
+const ABIL_META: Record<string, { en: string; ru: string }> =
+  Object.fromEntries(SPIDER_ABILITIES.map((a) => [a.key, { en: a.en, ru: a.ru }]));
+
+// ── Адаптивность: какую способность дать в ответ на тактику игрока ──
+// Считаем, как игрок ВЁЛ СЕБЯ на уровне, и на следующем добавляем способность,
+// которая максимально руинит его доминирующую тактику → заставляет менять стиль.
+//   still — много стоит/крадётся (молчит)        → SMELL (нюх найдёт и без шума, сквозь стены)
+//   hide  — двигается, но прячется за стенами     → HEAR  (слышит шаги сквозь стены)
+//   open  — часто на виду (бегает в открытую)     → SEE   (ловит на прямой видимости)
+//   flee  — убегает, держит большую дистанцию     → WEB   (паутина замедляет беглеца)
+//   loop  — петляет, водит кругами                → CLONE (клоны перекрывают пути)
+type TacticKey = 'still' | 'hide' | 'open' | 'flee' | 'loop';
+const TACTIC_COUNTER: Record<TacticKey, AbilityKey> = {
+  still: 'smell', hide: 'hear', open: 'see', flee: 'web', loop: 'clone',
+};
+const DEFAULT_ABIL_ORDER: AbilityKey[] = ['hear', 'see', 'smell', 'web', 'clone'];
+// Выбрать НОВУЮ способность: контра самой частой тактике, которой ещё нет у паука.
+function pickCounterAbility(tactics: Record<TacticKey, number>, owned: string[]): AbilityKey | null {
+  const ranked = (Object.keys(tactics) as TacticKey[])
+    .filter((t) => tactics[t] > 0)
+    .sort((a, b) => tactics[b] - tactics[a]);
+  for (const t of ranked) {
+    const c = TACTIC_COUNTER[t];
+    if (!owned.includes(c)) return c;
+  }
+  return DEFAULT_ABIL_ORDER.find((a) => !owned.includes(a)) ?? null; // запас: по умолчанию
+}
+
+// Профиль одной ноги паука в фазе ph: продольный мах (-1..1) и подъём ступни (0..1).
+// Как в природе: ОПОРА (бóльшая часть цикла) — ступня на полу, нога медленно
+// загребает назад (двигает тело вперёд); ПЕРЕНОС — ступня поднята, нога быстро
+// возвращается вперёд. Асимметрия «медленно назад / быстро вперёд» и есть «паучья».
+function spiderLegPose(ph: number) {
+  const DUTY = 0.6; // доля цикла со ступнёй на полу
+  const u = (((ph % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) / (2 * Math.PI); // 0..1
+  if (u < DUTY) {
+    const s = u / DUTY;                              // опора 0..1
+    return { swing: 1 - 2 * s, lift: 0 };           // вперёд → назад, ступня на полу
+  }
+  const w = (u - DUTY) / (1 - DUTY);                 // перенос 0..1
+  const e = 0.5 - 0.5 * Math.cos(Math.PI * w);       // плавный ease назад → вперёд
+  return { swing: -1 + 2 * e, lift: Math.sin(Math.PI * w) }; // подъём 0→1→0 в переносе
 }
 
 // Начальный уровень читаем из сохранения (чтобы сцена сразу строила нужный уровень)
@@ -42,6 +102,18 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   const [level, setLevel] = useState(initialLevel);
   const [levelCleared, setLevelCleared] = useState(false);
   const [dead, setDead] = useState(false); // паук коснулся игрока → смерть
+  // Заставка перед уровнем («SPAID CAN …»), список способностей паука, эффект паутины
+  const [showIntro, setShowIntro] = useState(false);
+  const introRef = useRef(false);
+  const [webbed, setWebbed] = useState(false); // игрок опутан паутиной (замедлен)
+  const [satiety, setSatiety] = useState(3);   // сытость 0..3 (голод убывает со временем)
+  const [starved, setStarved] = useState(false); // умер от голода
+  const [spiderAbil, setSpiderAbil] = useState<{ en: string; ru: string }[]>([]); // способности на тек. уровне
+  const [geminiSearch, setGeminiSearch] = useState(false); // Gemini ведёт паука в фазе поиска
+  // Адаптивность: накопленные способности паука (контра тактикам игрока) и метрики
+  // тактик за текущий уровень. Живут между уровнями через ref (не сбрасываются ререндером).
+  const ownedAbilRef = useRef<string[]>(['move']);
+  const tacticRef = useRef<Record<TacticKey, number>>({ still: 0, hide: 0, open: 0, flee: 0, loop: 0 });
   const [batteryCount, setBatteryCount] = useState(() => levelConfig(initialLevel()).batteries);
   const [switchCount, setSwitchCount] = useState(0);
   const [switchesOn, setSwitchesOn] = useState(0);
@@ -84,15 +156,21 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
     resume(); setCollected(0); setWon(false); setLevelCleared(false); setDead(false);
     setSwitchesOn(0); setLevel(1); setBatteryCount(levelConfig(1).batteries); setSwitchCount(0);
+    setWebbed(false); setShowIntro(true); setStarved(false); setSatiety(3);
+    ownedAbilRef.current = ['move']; // адаптивный набор — с чистого листа
     setRunId((r) => r + 1);
   };
   // Переход на следующий уровень (после экрана «уровень пройден»).
-  // Сохраняем только номер уровня → новый уровень строится с чистого листа.
+  // АДАПТИВНОСТЬ: смотрим, как игрок вёл себя на пройденном уровне, и добавляем
+  // пауку способность, которая максимально руинит его доминирующую тактику.
   const nextLevel = () => {
     const nl = Math.min(LEVELS, level + 1);
+    const add = pickCounterAbility(tacticRef.current, ownedAbilRef.current);
+    if (add) ownedAbilRef.current = [...ownedAbilRef.current, add];
     try { localStorage.setItem(SAVE_KEY, JSON.stringify({ level: nl })); } catch { /* нет localStorage */ }
     resume(); setLevelCleared(false); setCollected(0); setSwitchesOn(0); setWon(false); setDead(false);
     setLevel(nl); setRunId((r) => r + 1);
+    setWebbed(false); setShowIntro(true); setStarved(false); setSatiety(3); // заставка нового уровня
   };
   // Функция выброса батарейки — назначается внутри игрового цикла,
   // вызывается с клавиши Q.
@@ -100,6 +178,8 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
   // держим startedRef в синхроне со state (читается из игрового цикла)
   useEffect(() => { startedRef.current = started; }, [started]);
+  // заставка перед уровнем замораживает геймплей (читается из игрового цикла)
+  useEffect(() => { introRef.current = showIntro; }, [showIntro]);
 
   // После скримера (смерти от паука) — выброс обратно в меню
   useEffect(() => {
@@ -113,6 +193,20 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     }, 2400);
     return () => clearTimeout(t);
   }, [dead]);
+
+  // Смерть от голода — через пару секунд выброс обратно в меню (как при скримере)
+  useEffect(() => {
+    if (!starved) return;
+    const t = setTimeout(() => {
+      try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
+      setStarved(false); setStarted(false);
+      setCollected(0); setSwitchesOn(0); setLevel(1);
+      setBatteryCount(levelConfig(1).batteries); setSwitchCount(0);
+      ownedAbilRef.current = ['move'];
+      setRunId((r) => r + 1); // пересоздать сцену с чистого листа
+    }, 2400);
+    return () => clearTimeout(t);
+  }, [starved]);
 
   // «лифтовая» музыка играет только на главном экране (меню)
   useEffect(() => {
@@ -142,7 +236,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     const batteryGoal = cfg.batteries;   // сколько батареек нужно доставить
     const switchGoal = cfg.switches;     // сколько переключателей нужно дёрнуть
     // после 1-го уровня карта чуть-чуть растёт с каждым уровнем
-    const mapScale = 1 + (levelNum - 1) * 0.07; // L1=1.0 … L6≈1.35
+    const mapScale = 1 + (levelNum - 1) * 0.20; // +20% за уровень: L1=1.0 … L6=2.0
     const START_X = 9.5 * mapScale, START_Z = 0; // спавн игрока = центр центрального зала
     // центральный квадрат (в нём НЕ спавним батарейки/переключатели), масштабируется
     const CENTRAL = { minX: -5 * mapScale, maxX: 29 * mapScale, minZ: -10 * mapScale, maxZ: 10 * mapScale };
@@ -299,13 +393,15 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     });
 
     // ── Пол (железная плита) ───────────────────────────────
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), ironMat);
+    // Растёт вместе с картой (+комнаты-пристройки за периметром помещаются).
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(300 * mapScale, 300 * mapScale), ironMat);
     floor.rotation.x = -Math.PI / 2;
     floor.receiveShadow = true;
     scene.add(floor);
 
     // ── Стены + коллайдеры ─────────────────────────────────
     const colliders: Rect[] = [];
+    const wallMeshes: THREE.Mesh[] = []; // для raycaster паука (выравнивание по поверхности)
     const WALL_H = 4;
     const TH = 0.5; // толщина тонкой стены
 
@@ -316,7 +412,31 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       wall.castShadow = true; // загораживает свет → за стеной темно
       wall.receiveShadow = true;
       scene.add(wall);
+      wallMeshes.push(wall);
       colliders.push({ minX: x - sx / 2, maxX: x + sx / 2, minZ: z - sz / 2, maxZ: z + sz / 2 });
+    }
+
+    // Стена-линия с проёмами (двери). orient 'h' — вдоль X при фиксированном z;
+    // 'v' — вдоль Z при фиксированном x. gaps — отрезки [от,до] по подвижной оси,
+    // в которых стену НЕ строим (дверной проём).
+    function wallWithGaps(orient: 'h' | 'v', fixed: number, from: number, to: number, gaps: [number, number][]) {
+      const lo = Math.min(from, to), hi = Math.max(from, to);
+      const sorted = gaps.slice().sort((a, b) => a[0] - b[0]);
+      let cur = lo;
+      const segs: [number, number][] = [];
+      for (const [gs, ge] of sorted) {
+        const s = Math.max(lo, Math.min(gs, hi)), e = Math.max(lo, Math.min(ge, hi));
+        if (s > cur) segs.push([cur, s]);
+        cur = Math.max(cur, e);
+      }
+      if (cur < hi) segs.push([cur, hi]);
+      for (const [s, e] of segs) {
+        const len = e - s;
+        if (len <= 0.05) continue;
+        const mid = (s + e) / 2;
+        if (orient === 'h') addWall(mid, fixed, len + TH, TH);
+        else addWall(fixed, mid, TH, len + TH);
+      }
     }
 
     // === КАРТА = ТЕКСТОВАЯ СХЕМА ===
@@ -360,19 +480,75 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       }
     }
 
-    // ── Внешняя стена: запечатываем карту по краю сетки ────
-    // Схема дырявая по периметру (особенно верх/низ между комнатами) — без этой
-    // рамки игрок выходит из лабиринта в открытый мир. Стена идёт ровно по
-    // крайним линиям схемы (row0/rowMax, col0/colMax) и закрывает все щели.
+    // ── Новые комнаты-пристройки + внешняя стена с дверями ──
+    // Схема дырявая по периметру. Раньше периметр просто запечатывали сплошной
+    // рамкой. Теперь: находим, где коридор упирается в КРАЙ карты, пробиваем там
+    // дверь во внешней стене и пристраиваем СНАРУЖИ закрытую комнату (3 новые
+    // стены + стена карты с дверным проёмом). Игрок попадает в новые комнаты,
+    // но в открытое пространство НЕ выходит — комнаты замкнуты со всех сторон.
+    const bxMin = wx(0), bxMax = wx(cols * 2);
+    const bzMin = wz(0), bzMax = wz(rows * 2);
+    // расстояние до ближайшей стены КАРТЫ (периметра ещё нет — только стены схемы)
+    const edgeClear = (x: number, z: number) => {
+      let m = Infinity;
+      for (const b of colliders) {
+        const cx = Math.max(b.minX, Math.min(x, b.maxX));
+        const cz = Math.max(b.minZ, Math.min(z, b.maxZ));
+        const d = Math.hypot(x - cx, z - cz);
+        if (d < m) m = d;
+      }
+      return m;
+    };
+    // непрерывные «открытия» вдоль левого/правого края (там, где коридор у края)
+    const edgeRuns = (side: 'L' | 'R'): [number, number][] => {
+      const ex = side === 'L' ? bxMin : bxMax;
+      const inX = ex + (side === 'L' ? 1 : -1) * 1.3; // точка чуть внутри карты
+      const runs: [number, number][] = [];
+      let start: number | null = null, last = 0;
+      for (let z = bzMin + CW; z <= bzMax - CW; z += 1.0) {
+        const open = edgeClear(inX, z) >= 1.3 && edgeClear(ex, z) >= 0.4;
+        if (open) { if (start === null) start = z; last = z; }
+        else if (start !== null) { runs.push([start, last]); start = null; }
+      }
+      if (start !== null) runs.push([start, last]);
+      return runs;
+    };
+    const doorGapsL: [number, number][] = [];
+    const doorGapsR: [number, number][] = [];
+    const addAnnex = (side: 'L' | 'R', run: [number, number]) => {
+      const ex = side === 'L' ? bxMin : bxMax;
+      const dir = side === 'L' ? -1 : 1;                  // наружу от карты
+      const zc = (run[0] + run[1]) / 2;
+      const doorHalf = Math.min((run[1] - run[0]) / 2 + 0.4, CW * 0.7);
+      const RD = 8 * mapScale;                            // глубина комнаты наружу
+      const RH = Math.max(7 * mapScale, doorHalf * 2 + 4 * mapScale); // ширина по z
+      const farX = ex + dir * RD;
+      const midX = (ex + farX) / 2;
+      addWall(farX, zc, TH, RH + TH);                     // дальняя стена комнаты
+      addWall(midX, zc - RH / 2, RD + TH, TH);            // боковая
+      addWall(midX, zc + RH / 2, RD + TH, TH);            // боковая
+      (side === 'L' ? doorGapsL : doorGapsR).push([zc - doorHalf, zc + doorHalf]);
+    };
+    for (const side of ['L', 'R'] as const) {
+      const runs = edgeRuns(side)
+        .filter((r) => r[1] - r[0] >= 1.5 * mapScale)
+        .sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]));
+      const picked: [number, number][] = [];
+      for (const r of runs) {
+        const zc = (r[0] + r[1]) / 2;
+        if (picked.some((p) => Math.abs((p[0] + p[1]) / 2 - zc) < 10 * mapScale)) continue;
+        picked.push(r);
+        if (picked.length >= 3) break;                    // до 3 комнат на сторону
+      }
+      for (const r of picked) addAnnex(side, r);
+    }
+    // внешняя стена: верх/низ сплошные, лево/право — с дверными проёмами в комнаты
     {
-      const bxMin = wx(0), bxMax = wx(cols * 2);
-      const bzMin = wz(0), bzMax = wz(rows * 2);
-      const bcx = (bxMin + bxMax) / 2, bcz = (bzMin + bzMax) / 2;
-      const bW = bxMax - bxMin, bH = bzMax - bzMin;
-      addWall(bcx, bzMin, bW + TH, TH); // верхняя
-      addWall(bcx, bzMax, bW + TH, TH); // нижняя
-      addWall(bxMin, bcz, TH, bH + TH); // левая
-      addWall(bxMax, bcz, TH, bH + TH); // правая
+      const bcx = (bxMin + bxMax) / 2, bW = bxMax - bxMin;
+      addWall(bcx, bzMin, bW + TH, TH);                   // верхняя (сплошная)
+      addWall(bcx, bzMax, bW + TH, TH);                   // нижняя (сплошная)
+      wallWithGaps('v', bxMin, bzMin, bzMax, doorGapsL);  // левая с дверями
+      wallWithGaps('v', bxMax, bzMin, bzMax, doorGapsR);  // правая с дверями
     }
 
     // ── Тёмные зоны ────────────────────────────────────────
@@ -401,6 +577,10 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // комнаты (сплошная стена севернее зала, грань z=-16.85), не мигает.
     const GEN_X = 9.5 * mapScale, GEN_Z = -17.9 * mapScale, GEN_Y = 2.0; // вдавлен в стену (масштаб карты)
     const generator = new THREE.Group();
+    // Сдвиг свечения вперёд: основание ореола ставим на южную (внутреннюю) грань
+    // северной стены, чтобы НИ ОДНА полусфера не торчала за стену в открытое
+    // пространство (иначе сзади виден красный отблеск).
+    const SHELL_FWD = 0.8 * mapScale + 0.3;
     // красные оболочки свечения (аддитивные, без записи глубины — мягкий ореол)
     const genShell = (color: number, r: number, op: number) => {
       const m = new THREE.Mesh(
@@ -412,6 +592,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         }),
       );
       m.rotation.x = Math.PI / 2; // купол свечения развёрнут в зал
+      m.position.z = SHELL_FWD;   // весь ореол — перед стеной, в зале
       return m;
     };
     generator.add(
@@ -435,7 +616,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     generator.add(casing);
     // красный свет в окружение (поярче и подальше)
     const genLight = new THREE.PointLight(0xff0a05, 13, 16, 2);
-    genLight.position.set(0, 0, 1.7);   // вынесен в зал, перед стеной
+    genLight.position.set(0, 0, SHELL_FWD + 0.5);   // всегда в зале перед стеной (масштаб карты)
     genLight.castShadow = true;          // стена перекрывает свет → за карту не светит
     genLight.shadow.mapSize.set(512, 512);
     genLight.shadow.camera.near = 0.3;
@@ -485,27 +666,51 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // генератору; при касании коллизий батарейка исчезает (доставлена).
     function makeBattery(x: number, z: number): Battery {
       const g = new THREE.Group();
-      // Яркий emissive-материал: батарейка светится САМА (как объект), но НЕ
+      // «Энергоячейка»: тёмный металлический корпус-клетка со светящимся зелёным
+      // ядром, кольцами-акцентами и клеммой «+». Светится САМА (emissive), но НЕ
       // освещает окружение — поэтому её свет не пробивается сквозь стены.
-      const bodyMat = new THREE.MeshStandardMaterial({
-        color: 0x2bd24f, emissive: 0x2bff55, emissiveIntensity: 1.6,
-        metalness: 0.6, roughness: 0.3,
-      });
-      const capMat = new THREE.MeshStandardMaterial({
-        color: 0xdddddd, emissive: 0x777777, emissiveIntensity: 0.3,
-        metalness: 0.9, roughness: 0.4,
-      });
-      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 0.8, 16), bodyMat);
-      const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.12, 12), capMat);
-      cap.position.y = 0.46;
-      // «+» полоска сверху, чтобы читалось как батарейка
-      const band = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.285, 0.285, 0.1, 16),
-        new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xaaaaaa, emissiveIntensity: 0.5 }),
-      );
-      band.position.y = 0.28;
-      g.add(body, band, cap);
-      g.position.set(x, 0.55, z);
+      const GREEN = 0x39ff6a;
+      const shellMat = new THREE.MeshStandardMaterial({ color: 0x23272e, metalness: 0.95, roughness: 0.32, envMapIntensity: 0.9 });
+      const trimMat = new THREE.MeshStandardMaterial({ color: 0xc9d1d9, metalness: 1.0, roughness: 0.25, envMapIntensity: 1.1 });
+      const coreMat = new THREE.MeshStandardMaterial({ color: 0x2bd24f, emissive: GREEN, emissiveIntensity: 1.9, metalness: 0.2, roughness: 0.4 });
+      const haloMat = new THREE.MeshStandardMaterial({ color: GREEN, emissive: GREEN, emissiveIntensity: 0.7, transparent: true, opacity: 0.26, metalness: 0, roughness: 0.1 });
+      const ringMat = new THREE.MeshStandardMaterial({ color: GREEN, emissive: GREEN, emissiveIntensity: 1.6, metalness: 0.3, roughness: 0.4 });
+
+      // светящееся ядро (энергия) + полупрозрачный ореол вокруг
+      const core = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.66, 20), coreMat);
+      const halo = new THREE.Mesh(new THREE.CylinderGeometry(0.225, 0.225, 0.6, 20), haloMat);
+      g.add(core, halo);
+
+      // верхняя и нижняя «крышки» корпуса (тёмный металл, слегка конусом)
+      const capTop = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.25, 0.16, 20), shellMat);
+      capTop.position.y = 0.36; capTop.castShadow = true;
+      const capBot = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.27, 0.16, 20), shellMat);
+      capBot.position.y = -0.36; capBot.castShadow = true;
+      g.add(capTop, capBot);
+
+      // 4 ребра-стойки «клетки» вокруг ядра
+      for (let i = 0; i < 4; i++) {
+        const a = (i / 4) * Math.PI * 2;
+        const rib = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.56, 0.085), shellMat);
+        rib.position.set(Math.cos(a) * 0.225, 0, Math.sin(a) * 0.225);
+        rib.rotation.y = -a; rib.castShadow = true;
+        g.add(rib);
+      }
+
+      // светящиеся кольца-акценты на стыках крышек и ядра
+      for (const ry of [0.28, -0.28]) {
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(0.235, 0.022, 10, 28), ringMat);
+        ring.rotation.x = Math.PI / 2; ring.position.y = ry; g.add(ring);
+      }
+
+      // клемма «+» сверху и контакт снизу (яркий металл)
+      const nub = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.1, 16), trimMat);
+      nub.position.y = 0.49; nub.castShadow = true;
+      const botContact = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.05, 16), trimMat);
+      botContact.position.y = -0.465; botContact.castShadow = true;
+      g.add(nub, botContact);
+
+      g.position.set(x, 0.6, z);
       scene.add(g);
       return { group: g, delivered: false, carried: false, locked: false };
     }
@@ -577,6 +782,9 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // Чтобы батарейки/переключатели не спавнились в стенах или в отрезанных
     // карманах, считаем все клетки, до которых игрок реально доходит со спавна.
     const minWX = wx(0), maxWX = wx(cols * 2), minWZ = wz(0), maxWZ = wz(rows * 2);
+    // границы для флуд-фолла шире карты — чтобы достижимость заходила в
+    // комнаты-пристройки за левым/правым краем (иначе батарейки туда не попадут)
+    const reachMinX = minWX - 9 * mapScale, reachMaxX = maxWX + 9 * mapScale;
     // расстояние от точки до ближайшей стены (0 — внутри стены)
     const clearAt = (x: number, z: number) => {
       let m = Infinity;
@@ -602,7 +810,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         if (clearAt(x, z) >= STAND) reach.push({ x, z });
         for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
           const nx = ix + dx, nz = iz + dz, wxp = nx * STEP, wzp = nz * STEP;
-          if (wxp < minWX || wxp > maxWX || wzp < minWZ || wzp > maxWZ) continue;
+          if (wxp < reachMinX || wxp > reachMaxX || wzp < minWZ || wzp > maxWZ) continue;
           if (seen.has(key(nx, nz))) continue;
           if (clearAt(wxp, wzp) < GAP) { seen.add(key(nx, nz)); continue; }      // соседняя клетка в стене
           if (clearAt((x + wxp) / 2, (z + wzp) / 2) < GAP) continue;             // между клетками стена
@@ -666,7 +874,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       const r = cfg.randomness * 2.4;
       for (let t = 0; t < 6; t++) {
         const nx = c.x + (Math.random() - 0.5) * 2 * r, nz = c.z + (Math.random() - 0.5) * 2 * r;
-        if (clearAt(nx, nz) >= 1.3) return { x: nx, z: nz };
+        if (clearAt(nx, nz) >= 1.3 && !inCentral(nx, nz)) return { x: nx, z: nz }; // не в центр. зал
       }
       return c;
     };
@@ -698,6 +906,37 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       batteryPts.push(...more);
     }
     const batteries: Battery[] = batteryPts.slice(0, batteryGoal).map((p) => makeBattery(p.x, p.z));
+
+    // ── Мясо (восстанавливает сытость) ─────────────────────
+    // Лежит на полу по карте, слегка светится тёплым (чтобы найти в темноте).
+    // Подбирается касанием → +1 сытость. Голод убывает со временем (см. цикл).
+    function makeMeat(x: number, z: number): Meat {
+      const g = new THREE.Group();
+      const fleshMat = new THREE.MeshStandardMaterial({
+        color: 0x9e2b2b, emissive: 0x5a0f10, emissiveIntensity: 0.55, roughness: 0.6, metalness: 0.05,
+      });
+      const fatMat = new THREE.MeshStandardMaterial({ color: 0xd98c8c, emissive: 0x3a1414, emissiveIntensity: 0.4, roughness: 0.7 });
+      const boneMat = new THREE.MeshStandardMaterial({ color: 0xeae0cf, emissive: 0x4a4438, emissiveIntensity: 0.35, roughness: 0.5 });
+      // мясистый кусок (неровный) + жировые прожилки
+      const lump = new THREE.Mesh(new THREE.SphereGeometry(0.42, 14, 12), fleshMat);
+      lump.scale.set(1.1, 0.7, 0.85); lump.castShadow = true;
+      const lump2 = new THREE.Mesh(new THREE.SphereGeometry(0.26, 12, 10), fatMat);
+      lump2.position.set(0.18, 0.08, -0.1); lump2.castShadow = true;
+      // косточка, торчащая сбоку
+      const bone = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.5, 8), boneMat);
+      bone.rotation.z = Math.PI / 2.3; bone.position.set(-0.34, 0.06, 0.05); bone.castShadow = true;
+      const knob = new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 8), boneMat);
+      knob.position.set(-0.55, 0.12, 0.08);
+      g.add(lump, lump2, bone, knob);
+      g.position.set(x, 0.45, z);
+      scene.add(g);
+      return { group: g, eaten: false };
+    }
+    const meatGoal = 4 + levelNum; // мяса чуть больше с уровнем (голод тот же)
+    const meatPts = shuffle(reach.filter((c) =>
+      clearAt(c.x, c.z) >= 1.3 && Math.hypot(c.x - START_X, c.z - START_Z) > 6,
+    )).slice(0, meatGoal);
+    const meats: Meat[] = meatPts.map((p) => makeMeat(p.x, p.z));
 
     // ── Игрок: белый человечек с руками и ногами ───────────
     const player = new THREE.Group();
@@ -756,24 +995,235 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     player.scale.setScalar(2);      // игрок в 2 раза больше (хитбокс — PLAYER_R ниже)
     scene.add(player);
 
-    // ── Гигантский паук (только 1-й уровень) ───────────────
-    // Слепой и глухой: НИКАК не реагирует на игрока, просто бесконечно ползёт
-    // по периметру вдоль стен внутри карты (за карту не выходит).
-    type SpiderLeg = { legG: THREE.Group; fem: THREE.Group; baseY: number; baseFemur: number; side: number; phase: number };
-    let spider: { group: THREE.Group; legs: SpiderLeg[]; touchR: number } | null = null;
-    let spiderD = 0; // пройденный путь по периметру
-    // Паук кружит вдоль стен ЦЕНТРАЛЬНОГО зала (где стоит игрок) — так его видно
-    // и он реально опасен. За карту/зал не выходит.
-    function spiderPath(d: number) {
-      const x0 = CENTRAL.minX + 2, x1 = CENTRAL.maxX - 2, z0 = CENTRAL.minZ + 2, z1 = CENTRAL.maxZ - 2;
-      const w = Math.max(1, x1 - x0), h = Math.max(1, z1 - z0);
-      const P = 2 * (w + h);
-      let t = ((d % P) + P) % P;
-      if (t < w) return { x: x0 + t, z: z0, dir: [1, 0] as const };
-      t -= w; if (t < h) return { x: x1, z: z0 + t, dir: [0, 1] as const };
-      t -= h; if (t < w) return { x: x1 - t, z: z1, dir: [-1, 0] as const };
-      t -= h; return { x: x0, z: z1 - t, dir: [0, -1] as const };
+    // ── Гигантский паук: способности по уровням ────────────
+    // Чем дальше уровень — тем больше «чувств» у паука, и каждое бьёт по своей
+    // тактике игрока: HEAR (стой тихо) → SEE (прячься за стены) → SMELL (петляй) →
+    // WEB (рви линию видимости) → CLONE (не загоняй себя в угол). Пауков может
+    // быть несколько (клоны), поэтому держим МАССИВ экземпляров.
+    type SpiderLeg = { legG: THREE.Group; fem: THREE.Group; tib: THREE.Group; foot: THREE.Object3D; baseY: number; baseFemur: number; baseTibia: number; side: number; phase: number };
+    type SpiderState = 'IDLE' | 'CHASE' | 'PATROL';
+    type SpiderInst = {
+      group: THREE.Group; legs: SpiderLeg[]; touchR: number; legReach: number; bodyY: number;
+      heading: number; dist: number; bias: number;
+      state: SpiderState; wpX: number; wpZ: number; // текущая путевая точка патруля
+      stuck: number; lastX: number; lastZ: number;  // анти-залипание
+      idleT: number;                                // таймер засады (IDLE)
+    };
+    const spiders: SpiderInst[] = [];
+    // радиус коллизии паука = по ширине его тела/коридора (растёт с картой), чтобы
+    // он НЕ проходил сквозь стены телом, а полз вдоль/огибал их (как по стенам).
+    const SP_R = (CW - TH) / 2 * 0.7;
+
+    // АДАПТИВНЫЙ набор способностей паука (накоплен по тактикам игрока).
+    if (levelNum === 1) ownedAbilRef.current = ['move']; // новый забег — с чистого листа
+    // возобновлённая игра (сейв на уровне N, но способностей меньше) → добираем по умолчанию
+    while (ownedAbilRef.current.length < levelNum) {
+      const def = DEFAULT_ABIL_ORDER.find((a) => !ownedAbilRef.current.includes(a));
+      if (!def) break;
+      ownedAbilRef.current = [...ownedAbilRef.current, def];
     }
+    tacticRef.current = { still: 0, hide: 0, open: 0, flee: 0, loop: 0 }; // метрики тактик — заново
+    const owned = ownedAbilRef.current;
+    const can = {
+      hear:  owned.includes('hear'),
+      see:   owned.includes('see'),
+      smell: owned.includes('smell'),
+      web:   owned.includes('web'),
+      clone: owned.includes('clone'),
+    };
+    setSpiderAbil(owned.map((k) => ABIL_META[k]).filter(Boolean)); // для HUD и заставки
+
+    // дальности чувств (масштабируются вместе с картой)
+    const SEE_RANGE = 22 * mapScale;
+    const HEAR_RANGE = 12 * mapScale; // слышит ШАГИ, когда игрок двигается рядом (сквозь стены)
+    const SMELL_RANGE = 12 * mapScale;
+    const WEB_RANGE = 18 * mapScale;
+
+    // прямая видимость: между точками a и b нет стены
+    const hasLOS = (ax: number, az: number, bx: number, bz: number) => {
+      const dx = bx - ax, dz = bz - az;
+      const d = Math.hypot(dx, dz);
+      const steps = Math.ceil(d / 0.6);
+      for (let i = 1; i < steps; i++) {
+        const t = i / steps;
+        if (clearAt(ax + dx * t, az + dz * t) < 0.35) return false;
+      }
+      return true;
+    };
+
+    // след запаха игрока (для нюха): копим недавние позиции; паук идёт по «старому»
+    // следу с задержкой ~2 с — поэтому, петляя, можно сбить его со следа.
+    const scent: { x: number; z: number }[] = [];
+    let scentTimer = 0;
+
+    // громкий шум: активация переключателя ревёт сиреной. Паук со СЛУХОМ слышит
+    // её через всю карту и идёт на источник (несколько секунд помнит место).
+    let noiseAlert = 0;            // сек. оставшегося «слышу сирену»
+    let noiseX = 0, noiseZ = 0;    // где сработала сирена
+    const NOISE_HEARD = 6;         // сколько секунд паук идёт на шум
+
+    // ── Gemini в фазе ПОИСКА ───────────────────────────────
+    // Когда паук НЕ чувствует игрока, патруль вдоль стены предсказуем. Тогда курс
+    // поиска подсказывает Gemini (редко — раз в несколько секунд, чтобы не жечь
+    // бесплатный лимит). Чувствует игрока → рулят точные локальные чувства, Gemini
+    // молчит. Если Gemini недоступен — откат на патруль вдоль стен.
+    let searchTarget = Math.PI / 2;  // курс поиска от Gemini (радианы)
+    let searchActive = false;        // есть валидный ответ
+    let brainBusy = false;           // запрос уже в полёте
+    let brainTimer = 0;              // сек. с прошлого запроса
+    const BRAIN_EVERY = 5;          // опрос раз в 5 c — ~12/мин, под лимитом free
+    let brainNext = BRAIN_EVERY;    // динамический интервал (растёт при 429/ошибке)
+    let geminiOnline = false;        // удался ли последний запрос
+    let geminiShown = false;        // дедуп React-стейта индикатора
+    let lastSeenX = START_X, lastSeenZ = START_Z, hasLastSeen = false; // где видели игрока
+    // Ключ Gemini прямо из .env (VITE_GEMINI_API_KEY) → нейронка работает СРАЗУ,
+    // без деплоя edge-функции. Если ключа нет — пойдём через безопасную функцию `ai`.
+    // ⚠️ VITE_-ключ попадает в браузер; ок для локалки/личного билда, для прод —
+    // лучше edge-функция (оставь VITE_GEMINI_API_KEY пустым).
+    const DIRECT_KEY = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined) || '';
+    const askSearch = async (sx: number, sz: number) => {
+      if (brainBusy || (!DIRECT_KEY && !supabase)) return;
+      brainBusy = true;
+      try {
+        const system =
+          'Ты — ИИ паука-охотника в тёмном лабиринте (вид сверху, оси X и Z). ' +
+          'Игрока сейчас НЕ видно и НЕ слышно. Дай НЕПРЕДСКАЗУЕМЫЙ курс поиска, ' +
+          'чтобы прочесать лабиринт и перехватить игрока, а не ходить по кругу. ' +
+          'heading — ЦЕЛОЕ число градусов 0..359, где 0 = +Z, 90 = +X, 180 = -Z, 270 = -X.';
+        const known = hasLastSeen ? ` Последний раз игрок был у x=${lastSeenX.toFixed(0)}, z=${lastSeenZ.toFixed(0)}.` : '';
+        const prompt = `Паук: x=${sx.toFixed(0)}, z=${sz.toFixed(0)}. Карта по X от ${minWX.toFixed(0)} до ${maxWX.toFixed(0)}, по Z от ${minWZ.toFixed(0)} до ${maxWZ.toFixed(0)}.${known} Каким курсом ползти на поиск?`;
+        // структурированный вывод → модель ВСЕГДА возвращает строго {"heading": N}
+        const genCfg = {
+          thinkingConfig: { thinkingBudget: 0 },
+          responseMimeType: 'application/json',
+          responseSchema: { type: 'OBJECT', properties: { heading: { type: 'INTEGER' } }, required: ['heading'] },
+          maxOutputTokens: 40,
+          temperature: 1.0,
+        };
+        let text = '';
+        if (DIRECT_KEY) {
+          // прямой вызов Gemini из браузера по ключу из .env
+          const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${DIRECT_KEY}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: system }] },
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: genCfg,
+              }),
+            },
+          );
+          const d = await res.json();
+          text = d?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+        } else if (supabase) {
+          // безопасный путь через edge-функцию (ключ в секрете сервера)
+          const { data, error } = await supabase.functions.invoke('ai', { body: { prompt, system } });
+          text = (!error && data && typeof data.text === 'string') ? data.text : '';
+        }
+        const m = text.match(/\{[\s\S]*?\}/);
+        let ok = false;
+        if (m) {
+          const j = JSON.parse(m[0]);
+          if (typeof j.heading === 'number' && isFinite(j.heading)) {
+            searchTarget = (j.heading * Math.PI) / 180; searchActive = true; ok = true;
+          }
+        }
+        geminiOnline = ok;
+        brainNext = ok ? BRAIN_EVERY : 30; // ответ есть → обычный темп; нет (429/мусор) → ждём 30 c
+      } catch {
+        geminiOnline = false; // нет сети/ключа/лимита — откат на патруль вдоль стен
+        brainNext = 30;       // backoff, чтобы не долбить квоту
+      }
+      brainBusy = false;
+    };
+
+    // снаряды-паутина (стрельба): при попадании замедляют игрока
+    type WebShot = { mesh: THREE.Mesh; vx: number; vz: number; life: number };
+    const webs: WebShot[] = [];
+    let webCd = 1.5;        // задержка перед первым выстрелом
+    let webSlow = 0;        // сек. оставшегося замедления игрока
+    let webbedShown = false; // чтобы не дёргать React-стейт каждый кадр
+    let prevMx = 0, prevMz = 0; // прошлое направление игрока (для детекта петляния)
+    const makeWeb = (x: number, z: number, vx: number, vz: number) => {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(0.45, 12, 10),
+        new THREE.MeshStandardMaterial({ color: 0xf2f2f2, emissive: 0xcfcfcf, emissiveIntensity: 0.7, roughness: 0.6, metalness: 0 }),
+      );
+      m.position.set(x, 1.4, z);
+      scene.add(m);
+      webs.push({ mesh: m, vx, vz, life: 3 });
+    };
+
+    // клонирование (6-й уровень): периодически добавляется ещё паук
+    let cloneCd = 9;
+    const MAX_SPIDERS = 3;
+    const tmpFoot = new THREE.Vector3(); // переиспользуем для позиций лап (без аллокаций)
+
+    // ── Стейт-машина и скорости паука ──────────────────────
+    const SPIDER_SPEED = 3;              // обычная скорость ползания (игрок = 5)
+    const CHASE_MULT = 2.0;              // в погоне (знает, где ты) — ДВОЙНАЯ: 3*2 = 6 (быстрее игрока!)
+    const CHASE_RANGE = 7 * mapScale;    // подошёл ВПЛОТНУЮ (или почуял) → CHASE (засада)
+    const ESCAPE_RANGE = 24 * mapScale;  // дальше этого и не чует → выходит в PATROL
+    const TURN_PATROL = 2.4;             // рад/с поворот в патруле (плавно)
+    const TURN_CHASE = 4.2;              // рад/с поворот в погоне (резвее)
+
+    // ── Выравнивание по поверхности (raycast вниз) + глитч-фри ориентация ──
+    // Луч вниз из точки над пауком находит поверхность под ним; «живот» паука
+    // выравнивается по нормали через Quaternion.slerp, а разворот идёт строго
+    // вокруг этой нормали (локальной оси Y) → модель НЕ заваливается на бок/спину.
+    const surfRay = new THREE.Raycaster();
+    const RAY_ORIGIN = new THREE.Vector3();
+    const RAY_DIR = new THREE.Vector3(0, -1, 0);
+    const upN = new THREE.Vector3(0, 1, 0);
+    const fwdN = new THREE.Vector3();
+    const rightN = new THREE.Vector3();
+    const basisM = new THREE.Matrix4();
+    const targetQ = new THREE.Quaternion();
+    const surfTargets: THREE.Object3D[] = [floor, ...wallMeshes];
+    const orientSpider = (S: SpiderInst, slerpT: number) => {
+      const sp = S.group.position;
+      // нормаль поверхности под пауком (готово к стенам; на полу = вверх)
+      upN.set(0, 1, 0);
+      RAY_ORIGIN.set(sp.x, sp.y + 3, sp.z);
+      surfRay.set(RAY_ORIGIN, RAY_DIR); surfRay.far = 8;
+      const hit = surfRay.intersectObjects(surfTargets, false)[0];
+      if (hit && hit.face) {
+        const n = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+        if (n.y > 0.3) upN.copy(n).normalize(); // «пол-подобную» нормаль принимаем
+      }
+      // желаемый «вперёд» = по курсу, спроецирован на плоскость поверхности
+      fwdN.set(Math.sin(S.heading), 0, Math.cos(S.heading)).projectOnPlane(upN);
+      if (fwdN.lengthSq() < 1e-6) return;
+      fwdN.normalize();
+      rightN.crossVectors(upN, fwdN).normalize();
+      fwdN.crossVectors(rightN, upN).normalize();   // ре-ортогонализация (без перекосов)
+      basisM.makeBasis(rightN, upN, fwdN);           // локальные +X,+Y(вверх),+Z(вперёд)
+      targetQ.setFromRotationMatrix(basisM);
+      S.group.quaternion.slerp(targetQ, slerpT);     // плавно, без рывков
+    };
+
+    // выбрать путевую точку патруля: достижимая клетка подальше, по возможности в
+    // нужном направлении preferH (радианы). reach считается ниже — на момент вызова готов.
+    const wrapPi = (a: number) => { while (a > Math.PI) a -= Math.PI * 2; while (a < -Math.PI) a += Math.PI * 2; return a; };
+    const pickWaypoint = (fromX: number, fromZ: number, preferH: number | null) => {
+      let best: { x: number; z: number } | null = null, bestScore = -Infinity;
+      for (let t = 0; t < 26; t++) {
+        const c = reach[(Math.random() * reach.length) | 0];
+        if (!c) break;
+        const d = Math.hypot(c.x - fromX, c.z - fromZ);
+        if (d < 10 * mapScale) continue;             // не слишком близко
+        let score = Math.min(d, 40 * mapScale) * 0.05 + Math.random() * 0.5;
+        if (preferH != null) {
+          const ang = Math.atan2(c.x - fromX, c.z - fromZ);
+          score += Math.PI - Math.abs(wrapPi(ang - preferH)); // ближе к курсу Gemini → выше
+        }
+        if (score > bestScore) { bestScore = score; best = c; }
+      }
+      return best || reach[(Math.random() * reach.length) | 0] || { x: fromX, z: fromZ };
+    };
+
     function buildSpider() {
       // Ширина тела = ширина прохода коридора (≈ CW − TH), чтобы паук идеально
       // проходил в выход из центрального квадрата. По длине тело может быть больше.
@@ -876,7 +1326,8 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         const femurAngle = -side * upAngle;                     // бедро вверх-наружу
         const fem = boneZ(femurLen, legLen * 0.04, legLen * 0.06, femurAngle, redLeg);
         const tibiaWorld = -side * (Math.PI - downExtra);       // голень вниз-наружу
-        const tib = boneZ(tibiaLen, legLen * 0.018, legLen * 0.038, tibiaWorld - femurAngle, redLeg);
+        const baseTibia = tibiaWorld - femurAngle;
+        const tib = boneZ(tibiaLen, legLen * 0.018, legLen * 0.038, baseTibia, redLeg);
         // тёмный кончик-лапка
         const foot = new THREE.Mesh(new THREE.CylinderGeometry(legLen * 0.018, legLen * 0.008, legLen * 0.16, 6), footMat);
         foot.position.y = legLen * 0.08; foot.castShadow = true; tib.tip.add(foot);
@@ -887,17 +1338,46 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         const baseY = side > 0 ? (-0.7 + i * 0.47) : (0.7 - i * 0.47); // веер передних/задних ног
         legG.rotation.y = baseY;
         s.add(legG);
-        // фазы чередуются (переменный «тетрапод»): соседние ноги в противофазе
-        const phase = ((i + (side > 0 ? 1 : 0)) % 2) * Math.PI;
-        legs.push({ legG, fem: fem.g, baseY, baseFemur: femurAngle, side, phase });
+        // ПОПЕРЕМЕННАЯ ТЕТРАПОДНАЯ походка, как у настоящих пауков: 8 ног идут
+        // двумя группами по 4 «по диагонали» (L0,L2,R1,R3 ↔ L1,L3,R0,R2). Соседние
+        // ноги на одной стороне в противофазе, левая и правая стороны тоже. Лёгкая
+        // метахрональная волна (i*0.18) добавляет естественную «рябь».
+        const group = (i % 2 === 0) ? 0 : Math.PI;
+        const sideShift = side > 0 ? Math.PI : 0;
+        const phase = group + sideShift + i * 0.18;
+        legs.push({ legG, fem: fem.g, tib: tib.g, foot: tib.tip, baseY, baseFemur: femurAngle, baseTibia, side, phase });
       }
       s.position.y = -footY + 0.05; // ступни ровно на полу
       scene.add(s);
-      return { group: s, legs, touchR: bodyR }; // радиус касания тела (+ радиус игрока в проверке)
+      // горизонтальный размах лап от центра (чтобы касание ЛАП тоже убивало)
+      const legReach = bodyR * 0.55
+        + femurLen * Math.sin(upAngle)
+        + tibiaLen * Math.sin(Math.PI - downExtra);
+      return { group: s, legs, touchR: bodyR, legReach, bodyY: s.position.y };
     }
-    if (levelNum === 1) {
-      spider = buildSpider();
-      spiderD = (maxWX - minWX) * 0.4; // стартует не в углу
+    // создать паука в (x,z) с курсом heading и добавить в массив
+    const spawnSpider = (x: number, z: number, heading: number) => {
+      const v = buildSpider();
+      const p = new THREE.Vector3(x, 0, z);
+      resolveCircle(p, SP_R);                 // вытолкнуть из стены, если задело
+      v.group.position.set(p.x, v.bodyY, p.z);
+      v.group.rotation.y = heading;
+      // разный сдвиг курса у каждого паука → клоны не сбиваются в кучу
+      const bias = spiders.length * 0.7 - 0.35;
+      const wp = pickWaypoint(p.x, p.z, null);
+      spiders.push({
+        ...v, heading, dist: 0, bias,
+        state: 'IDLE', wpX: wp.x, wpZ: wp.z,
+        stuck: 0, lastX: p.x, lastZ: p.z, idleT: 0,
+      });
+    };
+    // паук спавнится на ВСЕХ уровнях в СЛУЧАЙНОЙ достижимой точке подальше от
+    // игрока (не всегда слева), курсом в случайную сторону.
+    {
+      const far = reach.filter((c) => Math.hypot(c.x - START_X, c.z - START_Z) > 18 * mapScale && clearAt(c.x, c.z) >= SP_R + 0.3);
+      const pool = far.length ? far : reach;
+      const cell = pool.length ? pool[Math.floor(Math.random() * pool.length)] : { x: minWX + SP_R + 1.2, z: 0 };
+      spawnSpider(cell.x, cell.z, Math.random() * Math.PI * 2);
     }
 
     // ── Клавиатура ─────────────────────────────────────────
@@ -992,6 +1472,8 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
             sw.active = true; sw.setActive(true);
             switchesActive++; setSwitchesOn(switchesActive);
             playSiren(); tryComplete();
+            // сирена — громкий шум: паук со слухом услышит через всю карту
+            if (can.hear) { noiseAlert = NOISE_HEARD; noiseX = player.position.x; noiseZ = player.position.z; }
             break;
           }
         }
@@ -1041,6 +1523,13 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // ── Состояние батареек ──
     let carrying: Battery | null = null; // батарейка в руках (или null)
     let collectedCount = 0;              // сколько доставлено в генератор
+
+    // ── Голод ──
+    const SATIETY_MAX = 3;               // максимум сытости (и старт)
+    const HUNGER_RATE = 1 / 15;          // теряем 1 сытость за ~15 c → полный бар ≈ 45 c
+    let satietyVal = SATIETY_MAX;        // текущая сытость (плавная)
+    let satietyShownT = 0;               // как давно обновляли HUD-стейт
+    setSatiety(SATIETY_MAX);             // сброс HUD на старте уровня
 
     // Выбросить батарейку: кладём её обратно на пол под игроком.
     const drop = () => {
@@ -1124,10 +1613,12 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       if (pausedRef.current) { renderer.render(scene, camera); return; } // на паузе — заморозка
       if (deadFlag) { renderer.render(scene, camera); return; }          // смерть — заморозка
 
-      const speed = carrying ? 5 * 0.67 : 5; // с батарейкой на 33% медленнее
+      const webMul = webSlow > 0 ? 0.45 : 1; // опутан паутиной → медленнее
+      const speed = (carrying ? 5 * 0.67 : 5) * webMul; // с батарейкой ещё на 33% медленнее
       let mx = (keys['KeyD'] || keys['ArrowRight'] ? 1 : 0) - (keys['KeyA'] || keys['ArrowLeft'] ? 1 : 0);
       let mz = (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0) - (keys['KeyW'] || keys['ArrowUp'] ? 1 : 0);
-      if (!startedRef.current) { mx = 0; mz = 0; } // на меню игрок стоит (сцена = фон)
+      // на меню и на заставке игрок стоит (сцена = фон)
+      if (!startedRef.current || introRef.current) { mx = 0; mz = 0; }
       const len = Math.hypot(mx, mz);
       const moving = len > 0;
 
@@ -1184,6 +1675,30 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         if (!b.delivered && !b.carried) b.group.rotation.y += dt * 1.5;
       }
 
+      // ── ГОЛОД: сытость убывает со временем; мясо её восстанавливает ──
+      if (startedRef.current && !introRef.current && !finished) {
+        satietyVal = Math.max(0, satietyVal - HUNGER_RATE * dt);
+        // подбор мяса касанием → +1 сытость (до максимума)
+        for (const m of meats) {
+          if (m.eaten) continue;
+          const mdx = m.group.position.x - player.position.x;
+          const mdz = m.group.position.z - player.position.z;
+          if (mdx * mdx + mdz * mdz < PICKUP_R * PICKUP_R) {
+            m.eaten = true; scene.remove(m.group);
+            satietyVal = Math.min(SATIETY_MAX, satietyVal + 1);
+          } else {
+            m.group.rotation.y += dt * 1.2; // лёгкое вращение, заметнее в темноте
+          }
+        }
+        // обновляем HUD-стейт несколько раз в секунду (не каждый кадр)
+        satietyShownT += dt;
+        if (satietyShownT > 0.2) { satietyShownT = 0; setSatiety(satietyVal); }
+        // сытость кончилась → смерть от голода
+        if (satietyVal <= 0) {
+          deadFlag = true; finished = true; setSatiety(0); setStarved(true);
+        }
+      }
+
       // ── анимация ходьбы ──
       walkAmt += ((moving ? 1 : 0) - walkAmt) * Math.min(1, dt * 10);
       if (moving) walkPhase += dt * 9;
@@ -1198,32 +1713,208 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       // лёгкое покачивание корпуса при ходьбе
       player.position.y = Math.abs(Math.sin(walkPhase)) * 0.06 * walkAmt;
 
-      // ── Паук: бесконечный обход периметра (слепой/глухой, игрока не видит) ──
-      if (spider) {
-        spiderD += dt * 6; // скорость ползания
-        const p = spiderPath(spiderD);
-        // тело строго внутри карты — за карту не выходит
-        spider.group.position.x = Math.min(maxWX - 1, Math.max(minWX + 1, p.x));
-        spider.group.position.z = Math.min(maxWZ - 1, Math.max(minWZ + 1, p.z));
-        spider.group.rotation.y = Math.atan2(p.dir[0], p.dir[1]); // мордой по ходу
-        // Реалистичная походка: ноги в противофазе (переменный тетрапод).
-        // В фазе переноса нога идёт вперёд И приподнимается, в опорной — назад на полу.
-        const gait = spiderD * 1.1;
-        for (const L of spider.legs) {
-          const ph = gait + L.phase;
-          L.legG.rotation.y = L.baseY + Math.sin(ph) * 0.3;            // мах вперёд/назад
-          const lift = Math.max(0, Math.cos(ph));                      // подъём в фазе переноса
-          L.fem.rotation.z = L.baseFemur + L.side * lift * 0.5;        // поднять лапу над полом
+      // ── Паук(и): чувства по уровню; вне игры и на заставке скрыты ──
+      const huntActive = startedRef.current && !introRef.current;
+      for (const S of spiders) S.group.visible = huntActive;
+      if (huntActive && !finished) {
+        // обновляем след запаха игрока (нюх идёт по «старому» следу с лагом)
+        scentTimer += dt;
+        if (scentTimer > 0.25) {
+          scentTimer = 0;
+          scent.push({ x: player.position.x, z: player.position.z });
+          if (scent.length > 8) scent.shift(); // ~2 с лага → петляя, сбиваешь след
         }
-        // касание игрока → смерть (👎)
-        if (!finished) {
-          const ddx = spider.group.position.x - player.position.x;
-          const ddz = spider.group.position.z - player.position.z;
-          const reach = spider.touchR + PLAYER_R + 0.8; // тело + игрок + немного на лапы
-          if (ddx * ddx + ddz * ddz < reach * reach) {
-            deadFlag = true; finished = true; setDead(true); playScream();
+        // CLONE: периодически добавляется ещё паук (подальше от игрока)
+        if (can.clone && spiders.length < MAX_SPIDERS) {
+          cloneCd -= dt;
+          if (cloneCd <= 0) {
+            cloneCd = 12;
+            const far = reach.filter((c) => Math.hypot(c.x - player.position.x, c.z - player.position.z) > 16 * mapScale);
+            const pick = far.length ? far[(spiders.length * 911) % far.length] : { x: minWX + SP_R + 1.2, z: 0 };
+            spawnSpider(pick.x, pick.z, Math.PI / 2);
           }
         }
+        // WEB: главный паук стреляет паутиной по прямой видимости (замедляет)
+        webCd -= dt;
+        if (can.web && webCd <= 0 && spiders.length) {
+          const sp0 = spiders[0].group.position;
+          const dx = player.position.x - sp0.x, dz = player.position.z - sp0.z;
+          const d = Math.hypot(dx, dz);
+          if (d < WEB_RANGE && d > 2 && hasLOS(sp0.x, sp0.z, player.position.x, player.position.z)) {
+            webCd = 2.6;
+            const sv = 16;
+            makeWeb(sp0.x, sp0.z, (dx / d) * sv, (dz / d) * sv);
+          }
+        }
+        // затухание «слышу сирену»
+        if (noiseAlert > 0) noiseAlert = Math.max(0, noiseAlert - dt);
+        // полёт снарядов-паутины: попал в игрока → замедление, в стену → исчез
+        if (webSlow > 0) webSlow = Math.max(0, webSlow - dt);
+        for (let i = webs.length - 1; i >= 0; i--) {
+          const w = webs[i];
+          w.mesh.position.x += w.vx * dt; w.mesh.position.z += w.vz * dt;
+          w.life -= dt;
+          const hx = w.mesh.position.x - player.position.x, hz = w.mesh.position.z - player.position.z;
+          const hitPlayer = hx * hx + hz * hz < (PLAYER_R + 0.5) * (PLAYER_R + 0.5);
+          const hitWall = clearAt(w.mesh.position.x, w.mesh.position.z) < 0.3;
+          if (hitPlayer) webSlow = 3.0;
+          if (hitPlayer || hitWall || w.life <= 0) { scene.remove(w.mesh); webs.splice(i, 1); }
+        }
+        if ((webSlow > 0) !== webbedShown) { webbedShown = webSlow > 0; setWebbed(webbedShown); }
+
+        // ── Движение каждого паука: стейт-машина IDLE / CHASE / PATROL ──
+        const probe = SP_R + 1.1;
+        const free = (vx: number, vz: number) => clearAt(vx, vz) > SP_R;
+        let packSensed = false;   // хоть один паук чувствует игрока (для Gemini-поиска)
+        let anyPatrol = false;    // кто-то патрулирует (для индикатора Gemini)
+        let nearestDist = Infinity; let nearestSp: SpiderInst | null = null; // ближайший паук (для метрик тактик)
+        for (const S of spiders) {
+          const sp = S.group.position;
+          const dx = player.position.x - sp.x, dz = player.position.z - sp.z;
+          const distP = Math.hypot(dx, dz);
+          if (distP < nearestDist) { nearestDist = distP; nearestSp = S; }
+
+          // ── ДЕТЕКЦИЯ игрока через чувства уровня (видит/слышит/нюхает) ──
+          let sensed = false, senseH = 0;
+          if (can.see && distP < SEE_RANGE && hasLOS(sp.x, sp.z, player.position.x, player.position.z)) {
+            sensed = true; senseH = Math.atan2(dx, dz);                      // ВИДИТ
+          } else if (can.hear && noiseAlert > 0) {
+            sensed = true; senseH = Math.atan2(noiseX - sp.x, noiseZ - sp.z); // СЛЫШИТ сирену
+          } else if (can.hear && moving && distP < HEAR_RANGE) {
+            sensed = true; senseH = Math.atan2(dx, dz);                      // СЛЫШИТ шаги вблизи
+          } else if (can.smell && distP < SMELL_RANGE && scent.length) {
+            const sc = scent[0]; sensed = true; senseH = Math.atan2(sc.x - sp.x, sc.z - sp.z); // НЮХ
+          }
+          if (sensed) { packSensed = true; lastSeenX = player.position.x; lastSeenZ = player.position.z; hasLastSeen = true; }
+
+          // ── ПЕРЕХОДЫ СОСТОЯНИЙ ──
+          const chaseTrigger = sensed || distP < CHASE_RANGE; // почуял ИЛИ подошёл вплотную (засада)
+          if (S.state !== 'CHASE' && chaseTrigger) {
+            S.state = 'CHASE';
+            // ===================== JUMPSCARE HOOK =====================
+            // Момент броска из засады/патруля в погоню (… → CHASE).
+            // СЮДА вставь воспроизведение своего звука скримера, напр.: playJumpscare();
+            // Срабатывает ОДИН раз при входе в CHASE.
+            // ==========================================================
+          } else if (S.state === 'CHASE' && !sensed && distP > ESCAPE_RANGE) {
+            S.state = 'PATROL';                          // игрок убежал далеко → патруль
+            const wp = pickWaypoint(sp.x, sp.z, searchActive ? searchTarget : null);
+            S.wpX = wp.x; S.wpZ = wp.z;
+          } else if (S.state === 'IDLE') {
+            S.idleT += dt;                               // засидевшись в засаде — идём патрулировать
+            if (S.idleT > 4) { S.state = 'PATROL'; const wp = pickWaypoint(sp.x, sp.z, null); S.wpX = wp.x; S.wpZ = wp.z; }
+          }
+          if (S.state === 'PATROL') anyPatrol = true;
+
+          // ── ЖЕЛАЕМЫЙ КУРС по состоянию ──
+          let desiredH = S.heading, moveScale = 1, turnRate = TURN_PATROL;
+          if (S.state === 'IDLE') {
+            moveScale = 0;                               // засада: стоит неподвижно
+            if (sensed) desiredH = senseH;              // но доворачивается к замеченной жертве
+          } else if (S.state === 'CHASE') {
+            desiredH = sensed ? senseH : Math.atan2(lastSeenX - sp.x, lastSeenZ - sp.z); // к игроку / последнему месту
+            turnRate = TURN_CHASE;
+          } else { // PATROL — плавно между путевыми точками
+            if (Math.hypot(S.wpX - sp.x, S.wpZ - sp.z) < 3 * mapScale) {
+              // дошёл: иногда замираем в засаде, иначе берём новую точку (плавный разворот)
+              if (Math.random() < 0.3) { S.state = 'IDLE'; S.idleT = 0; }
+              else { const wp = pickWaypoint(sp.x, sp.z, searchActive ? searchTarget : null); S.wpX = wp.x; S.wpZ = wp.z; }
+            }
+            desiredH = Math.atan2(S.wpX - sp.x, S.wpZ - sp.z);
+          }
+
+          // ── РУЛЁЖКА с обходом стен (без бесконечного кручения на месте) ──
+          const fwd = new THREE.Vector3(Math.sin(S.heading), 0, Math.cos(S.heading));
+          const frontFree = free(sp.x + fwd.x * probe, sp.z + fwd.z * probe);
+          let goalH = desiredH;
+          if (moveScale > 0 && !frontFree) {
+            const leftFree = free(sp.x + Math.sin(S.heading + 1.2) * probe, sp.z + Math.cos(S.heading + 1.2) * probe);
+            const rightFree = free(sp.x + Math.sin(S.heading - 1.2) * probe, sp.z + Math.cos(S.heading - 1.2) * probe);
+            if (leftFree && !rightFree) goalH = S.heading + 1.2;
+            else if (rightFree && !leftFree) goalH = S.heading - 1.2;
+            else if (leftFree && rightFree) goalH = wrapPi(desiredH - S.heading) > 0 ? S.heading + 1.2 : S.heading - 1.2;
+            else goalH = S.heading + Math.PI;            // тупик → плавный разворот
+          }
+          S.heading += Math.max(-turnRate * dt, Math.min(turnRate * dt, wrapPi(goalH - S.heading)));
+
+          // ── ДВИЖЕНИЕ (на резком довороте — медленнее: плавные дуги, без рывков) ──
+          const aligned = Math.max(0, Math.cos(wrapPi(goalH - S.heading)));
+          const baseSpeed = SPIDER_SPEED * (S.state === 'CHASE' ? CHASE_MULT : 1);
+          const spd = dt * baseSpeed * moveScale * (S.state === 'CHASE' ? 1 : 0.35 + 0.65 * aligned);
+          const before = sp.clone();
+          if (spd > 0) {
+            sp.x += Math.sin(S.heading) * spd; sp.z += Math.cos(S.heading) * spd;
+            sp.x = Math.min(maxWX - 1, Math.max(minWX + 1, sp.x));
+            sp.z = Math.min(maxWZ - 1, Math.max(minWZ + 1, sp.z));
+            resolveCircle(sp, SP_R);                     // тело не проходит сквозь стены
+          }
+          const moved = before.distanceTo(sp);
+          S.dist += moved;
+
+          // ── АНТИ-ЗАЛИПАНИЕ: хочет идти, но стоит → дёрнуть курс / сменить точку ──
+          if (moveScale > 0) {
+            if (moved < 0.01 * baseSpeed) S.stuck += dt; else S.stuck = Math.max(0, S.stuck - dt * 2);
+            if (S.stuck > 0.8) {
+              S.stuck = 0;
+              S.heading += (Math.random() < 0.5 ? -1 : 1) * (1 + Math.random());
+              if (S.state === 'PATROL') { const wp = pickWaypoint(sp.x, sp.z, null); S.wpX = wp.x; S.wpZ = wp.z; }
+            }
+          }
+
+          // ── ОРИЕНТАЦИЯ: живот по нормали поверхности, разворот вокруг неё ──
+          orientSpider(S, Math.min(1, dt * 10));
+
+          // ── ПОХОДКА (тетраподная) ──
+          const gait = S.dist * 1.9;
+          for (const L of S.legs) {
+            const { swing, lift } = spiderLegPose(gait + L.phase);
+            L.legG.rotation.y = L.baseY + swing * 0.42;
+            L.fem.rotation.z = L.baseFemur + L.side * lift * 0.7;
+            L.tib.rotation.z = L.baseTibia + L.side * lift * 0.5;
+          }
+          sp.y = S.bodyY + Math.abs(Math.sin(gait)) * S.touchR * 0.06;
+
+          // ── КАСАНИЕ → смерть: тело паука ИЛИ реальный кончик лапы ──
+          if (!finished) {
+            const bodyR = S.touchR + PLAYER_R;
+            let touched = dx * dx + dz * dz < bodyR * bodyR;
+            if (!touched) {
+              const footR = PLAYER_R + 0.5;
+              for (const L of S.legs) {
+                L.foot.getWorldPosition(tmpFoot);
+                const fdx = tmpFoot.x - player.position.x, fdz = tmpFoot.z - player.position.z;
+                if (fdx * fdx + fdz * fdz < footR * footR) { touched = true; break; }
+              }
+            }
+            if (touched) { deadFlag = true; finished = true; setDead(true); playScream(); }
+          }
+        }
+
+        // ── МЕТРИКИ ТАКТИКИ ИГРОКА (для адаптивной контр-способности на след. уровне) ──
+        const tr = tacticRef.current;
+        if (!moving) {
+          tr.still += dt;                                  // стоит/крадётся (избегает слуха)
+        } else {
+          const losN = nearestSp
+            ? hasLOS(nearestSp.group.position.x, nearestSp.group.position.z, player.position.x, player.position.z)
+            : false;
+          if (nearestDist < SEE_RANGE && losN) tr.open += dt; // бегает на виду
+          else tr.hide += dt;                                 // двигается, но прячется за стенами
+          if (nearestDist > ESCAPE_RANGE * 0.75) tr.flee += dt; // держит большую дистанцию / убегает
+          if ((prevMx || prevMz) && (mx * prevMx + mz * prevMz) < -0.3) tr.loop += dt * 3; // развернулся → петляет
+          prevMx = mx; prevMz = mz;
+        }
+
+        // ── Gemini выбирает КУДА патрулировать (когда не чувствует игрока) ──
+        // Раз в несколько секунд просим у нейронки курс — он влияет на выбор
+        // следующей путевой точки патруля (см. pickWaypoint(..., searchTarget)).
+        brainTimer += dt;
+        if (!packSensed && anyPatrol && brainTimer >= brainNext && !brainBusy && spiders.length) {
+          brainTimer = 0;
+          askSearch(spiders[0].group.position.x, spiders[0].group.position.z);
+        }
+        const searching = !packSensed && anyPatrol && searchActive && geminiOnline; // Gemini направляет патруль
+        if (searching !== geminiShown) { geminiShown = searching; setGeminiSearch(searching); }
       }
 
       if (mapView) {
@@ -1336,7 +2027,57 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
                 🚨 {switchesOn}/{switchCount}
               </span>
             )}
+            <span style={{ color: satiety <= 1 ? '#ff5a3c' : '#ffb44a' }} title="Сытость (ешь мясо!)">
+              {'🍖'.repeat(Math.max(0, Math.ceil(satiety)))}{satiety <= 0 ? '☠' : ''}
+            </span>
           </div>
+
+          {/* Способности паука на этом уровне */}
+          {spiderAbil.length > 0 && (
+            <div
+              style={{
+                position: 'absolute', top: 52, left: 12, fontSize: 14, fontWeight: 'bold',
+                fontFamily: 'monospace', textShadow: '0 0 8px #000', pointerEvents: 'none',
+                color: '#ff6a55',
+              }}
+            >
+              🕷 SPAID CAN: {spiderAbil.map((a) => a.en).join(', ')}
+            </div>
+          )}
+
+          {/* Gemini ведёт паука в фазе поиска (когда он тебя не чувствует) */}
+          {geminiSearch && (
+            <div
+              style={{
+                position: 'absolute', top: 72, left: 12, fontSize: 13, fontWeight: 'bold',
+                fontFamily: 'monospace', textShadow: '0 0 8px #000', pointerEvents: 'none',
+                color: '#c8a8ff',
+              }}
+            >
+              🧠 паук ищет тебя (Gemini)
+            </div>
+          )}
+
+          {/* Опутан паутиной — игрок замедлен */}
+          {webbed && (
+            <div
+              style={{
+                position: 'absolute', inset: 0, pointerEvents: 'none',
+                boxShadow: 'inset 0 0 160px 40px rgba(245,245,245,0.35)',
+                border: '6px solid rgba(255,255,255,0.25)',
+              }}
+            >
+              <div
+                style={{
+                  position: 'absolute', bottom: '14%', left: 0, right: 0, textAlign: 'center',
+                  color: '#fff', fontFamily: 'monospace', fontSize: 22, fontWeight: 'bold',
+                  textShadow: '0 0 10px #000',
+                }}
+              >
+                🕸 ОПУТАН ПАУТИНОЙ — ты замедлен!
+              </div>
+            </div>
+          )}
 
           {/* Все батарейки доставлены, но не все переключатели дёрнуты — напоминание */}
           {switchCount > 0 && collected >= batteryCount && switchesOn < switchCount && (
@@ -1386,11 +2127,6 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
               0%,100% { background: #000; }
               50% { background: #5e0000; }
             }
-            @keyframes scr-dislike {
-              0%,60% { opacity: 0; transform: scale(0.3); }
-              75% { opacity: 1; transform: scale(1.25); }
-              100% { opacity: 1; transform: scale(1); }
-            }
           `}</style>
           <div
             style={{
@@ -1415,17 +2151,70 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
                 }}
               />
             </div>
-            {/* дизлайк поверх в конце */}
-            <div
-              style={{
-                position: 'relative', zIndex: 2, fontSize: 'min(30vw, 260px)', lineHeight: 1,
-                filter: 'drop-shadow(0 0 30px #000)', animation: 'scr-dislike 1.6s ease-out forwards',
-              }}
-            >
-              👎
-            </div>
           </div>
         </>
+      )}
+
+      {/* Смерть от голода */}
+      {starved && (
+        <div
+          style={{
+            position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center', gap: 16, zIndex: 30,
+            background: 'rgba(10,4,2,0.92)', color: '#fff', fontFamily: 'monospace',
+          }}
+        >
+          <div style={{ fontSize: 'min(18vw, 120px)' }}>🍖☠</div>
+          <div style={{ fontSize: 'min(8vw, 56px)', fontWeight: 'bold', letterSpacing: 3, color: '#ff7a4a', textShadow: '0 0 20px #5a0f10' }}>
+            ВЫ УМЕРЛИ ОТ ГОЛОДА
+          </div>
+          <div style={{ fontSize: 16, opacity: 0.8 }}>надо было есть мясо…</div>
+        </div>
+      )}
+
+      {/* Заставка перед уровнем: «SPAID CAN …» — что умеет паук на этом уровне */}
+      {started && showIntro && !dead && !won && !exited && (
+        <div
+          style={{
+            position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center', gap: 22, zIndex: 20,
+            background: 'rgba(4,2,3,0.88)', color: '#fff', fontFamily: 'monospace',
+          }}
+        >
+          <div style={{ fontSize: 14, letterSpacing: 4, color: '#9fd0ff' }}>
+            УРОВЕНЬ {level} / {LEVELS}
+          </div>
+          <div
+            style={{
+              fontSize: 'min(8vw, 74px)', fontWeight: 'bold', letterSpacing: 3, textAlign: 'center',
+              padding: '0 16px', textShadow: '0 0 24px #ff2a1a, 0 0 48px #7a0000',
+            }}
+          >
+            {'SPAID CAN ' + spiderAbil.map((a) => a.en).join(', ')}
+          </div>
+          {level > 1 && (
+            <div style={{ fontSize: 13, color: '#c8a8ff', marginTop: -8 }}>
+              паук адаптируется под твою тактику — придётся менять стиль
+            </div>
+          )}
+          <div style={{ width: 'min(88vw, 640px)', display: 'flex', flexDirection: 'column', gap: 9 }}>
+            {spiderAbil.map((a) => (
+              <div key={a.en} style={{ fontSize: 'min(2.6vw, 16px)', lineHeight: 1.4, color: '#d8dde3' }}>
+                <span style={{ color: '#ff6a55', fontWeight: 'bold' }}>🕷 {a.en}</span> — {a.ru}
+              </div>
+            ))}
+          </div>
+          <button
+            onClick={() => setShowIntro(false)}
+            style={{
+              marginTop: 6, padding: '16px 44px', fontSize: 22, fontWeight: 'bold', fontFamily: 'monospace',
+              background: '#c0160c', color: '#fff', border: 'none', borderRadius: 12, cursor: 'pointer',
+              boxShadow: '0 4px 18px rgba(0,0,0,0.6)',
+            }}
+          >
+            ▶ В лабиринт
+          </button>
+        </div>
       )}
 
       {/* Победа — надпись на весь экран + кнопка возврата */}
@@ -1574,7 +2363,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
           {/* Кнопка «Играть» — слева */}
           <button
-            onClick={() => setStarted(true)}
+            onClick={() => { setShowIntro(true); setStarted(true); }}
             style={{
               position: 'absolute', top: '50%', left: '8%', transform: 'translateY(-50%)',
               padding: '20px 56px', fontSize: 28, fontWeight: 'bold', fontFamily: 'monospace',
@@ -1683,6 +2472,29 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
               pointerEvents: 'none',
             }}
           />
+
+          {/* Описание игры — под картинкой справа */}
+          <div
+            style={{
+              position: 'absolute', top: 'calc(50% + min(9.5vw, 120px))', right: '6%',
+              transform: 'translateX(50%)',
+              width: 'min(34vw, 340px)', textAlign: 'center',
+              fontSize: 'min(1.6vw, 15px)', lineHeight: 1.5, color: '#d8dde3',
+              textShadow: '0 0 8px #000', pointerEvents: 'none',
+            }}
+          >
+            <div style={{ color: '#ff5a47', fontWeight: 'bold', marginBottom: 6, letterSpacing: 1 }}>
+              🕷 Хоррор-лабиринт
+            </div>
+            Вы заперты в тёмном железном лабиринте, по которому бродит
+            гигантский паук-охотник. Соберите все&nbsp;
+            <span style={{ color: '#2bff55' }}>батарейки</span>
+            &nbsp;и отнесите их к&nbsp;
+            <span style={{ color: '#ff5a47' }}>красному генератору</span>, нажмите все&nbsp;
+            <span style={{ color: '#ff8a2a' }}>кнопки-переключатели</span>
+            &nbsp;на стенах (клавиша&nbsp;E) — и пройдите все 6&nbsp;уровней.
+            Не попадитесь пауку: одно касание&nbsp;— и&nbsp;конец.
+          </div>
         </div>
       )}
 

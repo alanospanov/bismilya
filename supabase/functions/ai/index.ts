@@ -9,7 +9,7 @@
 // Модель можно поменять (gemini-2.0-flash — быстрая и бесплатная).
 
 const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY');
-const MODEL = 'gemini-2.0-flash';
+const MODEL = 'gemini-2.5-flash-lite';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -34,6 +34,8 @@ Deno.serve(async (req) => {
         body: JSON.stringify({
           systemInstruction: system ? { parts: [{ text: system }] } : undefined,
           contents: [{ parts: [{ text: prompt }] }],
+          // быстрый ответ: без «размышлений» и коротко (паук опрашивается часто)
+          generationConfig: { thinkingConfig: { thinkingBudget: 0 }, maxOutputTokens: 64, temperature: 0.4 },
         }),
       },
     );
