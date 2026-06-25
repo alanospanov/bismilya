@@ -7,23 +7,31 @@ type Rect = { minX: number; maxX: number; minZ: number; maxZ: number };
 
 // Батарейка: меш + состояние (доставлена в генератор / несётся игроком /
 // заблокирована от мгновенного повторного подбора сразу после выброса)
-type Battery = { group: THREE.Group; delivered: boolean; carried: boolean; locked: boolean };
+type Battery = {
+  group: THREE.Group;
+  delivered: boolean;
+  carried: boolean;
+  locked: boolean;
+  pickupAbilityGiven: boolean;
+  insertAbilityGiven: boolean;
+};
 // Переключатель: меш + флаг активации + функция смены вида (красный↔зелёный)
 type Switch = { group: THREE.Group; x: number; z: number; active: boolean; setActive: (b: boolean) => void };
 // Мясо: лежит на карте, восстанавливает сытость при подборе
 type Meat = { group: THREE.Group; eaten: boolean };
 const SAVE_KEY = 'spaidcan_save_v2'; // ключ прогресса (v2 — сбрасываем старые сейвы, застрявшие на ур.6)
-const LEVELS = 6;                 // всего уровней
+const LEVELS = 7;                 // всего уровней
 
 // Конфиг уровня: чем дальше — тем больше батареек и рандома. Переключатели
 // появляются после 3-го уровня, выступы-карманы (альковы) — после 4-го.
 function levelConfig(level: number) {
   const lv = Math.min(LEVELS, Math.max(1, level));
+  const finalLevel = lv === LEVELS;
   return {
-    batteries: 2 + lv,                              // L1=3 … L6=8
+    batteries: finalLevel ? 4 : 2 + lv,             // L1=3 … L6=8, L7=4
     randomness: Math.min(1, 0.12 + (lv - 1) * 0.18), // разброс спавна растёт
-    switches: lv >= 3 ? lv - 2 : 0,                 // L3=1, L4=2, L5=3, L6=4
-    alcoves: lv >= 5 ? lv - 4 : 0,                  // L5=1, L6=2 (чуть-чуть выступов)
+    switches: finalLevel ? 0 : (lv >= 3 ? lv - 2 : 0), // L7 без переключателей
+    alcoves: 0, // закрытые карманы/комнаты отключены
   };
 }
 
@@ -35,9 +43,11 @@ const SPIDER_ABILITIES = [
   { key: 'move',  en: 'MOVE',       ru: 'двигаться' },
   { key: 'hear',  en: 'HEAR',       ru: 'СЛЫШАТЬ — идёт на шум твоих шагов (стой на месте, чтобы не услышал)' },
   { key: 'see',   en: 'SEE',        ru: 'ВИДЕТЬ — рвётся к тебе на прямой видимости (прячься за стены)' },
-  { key: 'smell', en: 'SMELL',      ru: 'НЮХАТЬ — идёт по следу запаха сквозь стены (петляй и сбивай след)' },
+  { key: 'smell', en: 'SMELL',      ru: 'НЮХАТЬ — идёт по следу запаха рядом, но стены его блокируют' },
   { key: 'web',   en: 'SHOOT WEBS', ru: 'СТРЕЛЯТЬ ПАУТИНОЙ — замедляет тебя (разрывай линию видимости)' },
   { key: 'clone', en: 'CLONE',      ru: 'КЛОНИРОВАТЬСЯ — появляются ещё пауки (не загоняй себя в угол)' },
+  { key: 'climb', en: 'CLIMB WALLS', ru: 'ПЕРЕЛЕЗАТЬ ЧЕРЕЗ СТЕНЫ — на последнем уровне стены его уже не держат' },
+  { key: 'hunger', en: 'STARVE YOU', ru: 'МОРИТ ГОЛОДОМ — сытость тает со временем, ищи мясо (при полной не берёшь)' },
 ] as const;
 type AbilityKey = (typeof SPIDER_ABILITIES)[number]['key'];
 const ABIL_META: Record<string, { en: string; ru: string }> =
@@ -55,7 +65,7 @@ type TacticKey = 'still' | 'hide' | 'open' | 'flee' | 'loop';
 const TACTIC_COUNTER: Record<TacticKey, AbilityKey> = {
   still: 'smell', hide: 'hear', open: 'see', flee: 'web', loop: 'clone',
 };
-const DEFAULT_ABIL_ORDER: AbilityKey[] = ['hear', 'see', 'smell', 'web', 'clone'];
+const DEFAULT_ABIL_ORDER: AbilityKey[] = ['hear', 'see', 'smell', 'web', 'hunger', 'clone'];
 // Выбрать НОВУЮ способность: контра самой частой тактике, которой ещё нет у паука.
 function pickCounterAbility(tactics: Record<TacticKey, number>, owned: string[]): AbilityKey | null {
   const ranked = (Object.keys(tactics) as TacticKey[])
@@ -98,6 +108,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   // Счётчик доставленных батареек, флаг победы, несёт ли игрок батарейку сейчас
   const [collected, setCollected] = useState(0);
   const [won, setWon] = useState(false);
+  const [finalEnding, setFinalEnding] = useState(false);
   // Система уровней: текущий уровень, экран «уровень пройден», счётчики для HUD
   const [level, setLevel] = useState(initialLevel);
   const [levelCleared, setLevelCleared] = useState(false);
@@ -142,19 +153,27 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   // Вид от первого лица (true) ↔ от третьего (false). Кнопка переключает туда-обратно.
   const [firstPerson, setFirstPerson] = useState(false);
   const firstPersonRef = useRef(false); // читается из игрового цикла
-  useEffect(() => { firstPersonRef.current = firstPerson; }, [firstPerson]);
+  useEffect(() => {
+    firstPersonRef.current = firstPerson;
+    if (!firstPerson && document.pointerLockElement) document.exitPointerLock?.();
+  }, [firstPerson]);
   // runId меняется при «Играть заново» → useEffect пересоздаёт всю сцену
   const [runId, setRunId] = useState(0);
 
   const saveProgress = () => {
     try { const s = getStateRef.current?.(); if (s) localStorage.setItem(SAVE_KEY, JSON.stringify(s)); } catch { /* нет localStorage */ }
   };
+  const saveLevelOnly = (targetLevel: number) => {
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify({ level: targetLevel })); } catch { /* нет localStorage */ }
+  };
+  const pause = () => { pausedRef.current = true; setPaused(true); };
   const resume = () => { pausedRef.current = false; setPaused(false); };
   const goToMenu = () => { saveProgress(); resume(); setStarted(false); }; // в главное меню (прогресс сохранён)
   const exitGame = () => { saveProgress(); resume(); setStarted(false); setExited(true); }; // выйти из игры
   const restart = () => {
     try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
     resume(); setCollected(0); setWon(false); setLevelCleared(false); setDead(false);
+    setFinalEnding(false);
     setSwitchesOn(0); setLevel(1); setBatteryCount(levelConfig(1).batteries); setSwitchCount(0);
     setWebbed(false); setShowIntro(true); setStarved(false); setSatiety(3);
     ownedAbilRef.current = ['move']; // адаптивный набор — с чистого листа
@@ -169,12 +188,46 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     if (add) ownedAbilRef.current = [...ownedAbilRef.current, add];
     try { localStorage.setItem(SAVE_KEY, JSON.stringify({ level: nl })); } catch { /* нет localStorage */ }
     resume(); setLevelCleared(false); setCollected(0); setSwitchesOn(0); setWon(false); setDead(false);
+    setFinalEnding(false);
     setLevel(nl); setRunId((r) => r + 1);
     setWebbed(false); setShowIntro(true); setStarved(false); setSatiety(3); // заставка нового уровня
   };
   // Функция выброса батарейки — назначается внутри игрового цикла,
   // вызывается с клавиши Q.
   const dropFnRef = useRef<(() => void) | undefined>(undefined);
+  const switchFnRef = useRef<(() => void) | undefined>(undefined);
+  const mobileInputRef = useRef({ mx: 0, mz: 0 });
+  const joystickRef = useRef<HTMLDivElement>(null);
+  const [showTouchControls, setShowTouchControls] = useState(false);
+  const [stick, setStick] = useState({ x: 0, y: 0, active: false });
+
+  useEffect(() => {
+    const mq = window.matchMedia('(pointer: coarse), (max-width: 760px)');
+    const sync = () => setShowTouchControls(mq.matches);
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
+
+  const updateJoystick = (clientX: number, clientY: number) => {
+    const el = joystickRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const max = Math.min(r.width, r.height) * 0.34;
+    const dx = clientX - (r.left + r.width / 2);
+    const dy = clientY - (r.top + r.height / 2);
+    const len = Math.hypot(dx, dy);
+    const scale = len > max ? max / len : 1;
+    const sx = dx * scale;
+    const sy = dy * scale;
+    mobileInputRef.current = { mx: sx / max, mz: sy / max };
+    setStick({ x: sx, y: sy, active: true });
+  };
+
+  const clearJoystick = () => {
+    mobileInputRef.current = { mx: 0, mz: 0 };
+    setStick({ x: 0, y: 0, active: false });
+  };
 
   // держим startedRef в синхроне со state (читается из игрового цикла)
   useEffect(() => { startedRef.current = started; }, [started]);
@@ -185,28 +238,27 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
   useEffect(() => {
     if (!dead) return;
     const t = setTimeout(() => {
-      try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
+      saveLevelOnly(level);
       setDead(false); setStarted(false);
-      setCollected(0); setSwitchesOn(0); setLevel(1);
-      setBatteryCount(levelConfig(1).batteries); setSwitchCount(0);
+      setCollected(0); setSwitchesOn(0); setLevel(level);
+      setBatteryCount(levelConfig(level).batteries); setSwitchCount(0);
       setRunId((r) => r + 1); // пересоздать сцену с чистого листа
     }, 2400);
     return () => clearTimeout(t);
-  }, [dead]);
+  }, [dead, level]);
 
   // Смерть от голода — через пару секунд выброс обратно в меню (как при скримере)
   useEffect(() => {
     if (!starved) return;
     const t = setTimeout(() => {
-      try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
+      saveLevelOnly(level);
       setStarved(false); setStarted(false);
-      setCollected(0); setSwitchesOn(0); setLevel(1);
-      setBatteryCount(levelConfig(1).batteries); setSwitchCount(0);
-      ownedAbilRef.current = ['move'];
+      setCollected(0); setSwitchesOn(0); setLevel(level);
+      setBatteryCount(levelConfig(level).batteries); setSwitchCount(0);
       setRunId((r) => r + 1); // пересоздать сцену с чистого листа
     }, 2400);
     return () => clearTimeout(t);
-  }, [starved]);
+  }, [starved, level]);
 
   // «лифтовая» музыка играет только на главном экране (меню)
   useEffect(() => {
@@ -232,6 +284,8 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
     // ── Конфиг текущего уровня ─────────────────────────────
     const levelNum = level;
+    const onlyMoveSpider = levelNum === LEVELS;
+    let hungerActive = false; // включается только если паук получил способность hunger
     const cfg = levelConfig(levelNum);
     const batteryGoal = cfg.batteries;   // сколько батареек нужно доставить
     const switchGoal = cfg.switches;     // сколько переключателей нужно дёрнуть
@@ -401,19 +455,31 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
     // ── Стены + коллайдеры ─────────────────────────────────
     const colliders: Rect[] = [];
+    const wallRects: Rect[] = [];
     const wallMeshes: THREE.Mesh[] = []; // для raycaster паука (выравнивание по поверхности)
     const WALL_H = 4;
     const TH = 0.5; // толщина тонкой стены
+    const centralDoorZones: { x: number; z: number; halfX: number; halfZ: number }[] = [];
 
     // тонкая стена: центр (x,z) и размеры по x,z
     function addWall(x: number, z: number, sx: number, sz: number) {
+      const rect = { minX: x - sx / 2, maxX: x + sx / 2, minZ: z - sz / 2, maxZ: z + sz / 2 };
+      const blocksCentralDoor = centralDoorZones.some((d) =>
+        rect.maxX > d.x - d.halfX &&
+        rect.minX < d.x + d.halfX &&
+        rect.maxZ > d.z - d.halfZ &&
+        rect.minZ < d.z + d.halfZ
+      );
+      if (blocksCentralDoor) return;
+
       const wall = new THREE.Mesh(new THREE.BoxGeometry(sx, WALL_H, sz), wallMat);
       wall.position.set(x, WALL_H / 2, z);
       wall.castShadow = true; // загораживает свет → за стеной темно
       wall.receiveShadow = true;
       scene.add(wall);
       wallMeshes.push(wall);
-      colliders.push({ minX: x - sx / 2, maxX: x + sx / 2, minZ: z - sz / 2, maxZ: z + sz / 2 });
+      colliders.push(rect);
+      wallRects.push(rect);
     }
 
     // Стена-линия с проёмами (двери). orient 'h' — вдоль X при фиксированном z;
@@ -449,15 +515,15 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       "    +-+-+     +-+-+-+       +-+-+     +-+-+         +-+-+-+  ",
       "    |               |       |             |         |     |  ",
       "+-+-+   +-+-+-+     +-+-+   +             +   +-+-+-+     +-+",
-      "|       |     |         |   |             |                 |",
+      "|       |     |             |             |                 |",
       "+       +     +-+-+-+-+ +   +             +   +             +",
       "|       |             | |   |             |   |             |",
       "+       +     +-+-+-+-+ +   +             +   + +-+-+-+-+-+-+",
-      "|                                             |             |",
+      "|                       |                     |             |",
       "+       +     +-+-+-+-+ +   +             +   +-+-+-+-+-+-+-+",
       "|       |             | |   |             |   |             |",
       "+       +     +-+-+-+-+ +   +             +   +             +",
-      "|       |     |         |   |             |                 |",
+      "|       |     |             |             |                 |",
       "+ +-+   +-+-+-+     +-+-+   +             +   +-+-+-+     +-+",
       "    |               |       |             |         |     |  ",
       "    +-+-+     +-+-+-+       +-+-+     +-+-+         +-+-+-+  ",
@@ -515,6 +581,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     };
     const doorGapsL: [number, number][] = [];
     const doorGapsR: [number, number][] = [];
+    /*
     const addAnnex = (side: 'L' | 'R', run: [number, number]) => {
       const ex = side === 'L' ? bxMin : bxMax;
       const dir = side === 'L' ? -1 : 1;                  // наружу от карты
@@ -529,18 +596,12 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       addWall(midX, zc + RH / 2, RD + TH, TH);            // боковая
       (side === 'L' ? doorGapsL : doorGapsR).push([zc - doorHalf, zc + doorHalf]);
     };
+    */
     for (const side of ['L', 'R'] as const) {
       const runs = edgeRuns(side)
         .filter((r) => r[1] - r[0] >= 1.5 * mapScale)
         .sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]));
-      const picked: [number, number][] = [];
-      for (const r of runs) {
-        const zc = (r[0] + r[1]) / 2;
-        if (picked.some((p) => Math.abs((p[0] + p[1]) / 2 - zc) < 10 * mapScale)) continue;
-        picked.push(r);
-        if (picked.length >= 3) break;                    // до 3 комнат на сторону
-      }
-      for (const r of picked) addAnnex(side, r);
+      void runs;
     }
     // внешняя стена: верх/низ сплошные, лево/право — с дверными проёмами в комнаты
     {
@@ -552,6 +613,25 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     }
 
     // ── Тёмные зоны ────────────────────────────────────────
+    if (onlyMoveSpider) {
+      const sideRoomZ0 = -16 * mapScale;
+      const sideRoomZ1 = 16 * mapScale;
+      const sideGap = 3.2 * mapScale;
+      const sideRooms: { x0: number; x1: number; cx: number }[] = [];
+      for (const r of sideRooms) {
+        wallWithGaps('v', r.cx, sideRoomZ0, sideRoomZ1, [[-sideGap, sideGap]]);
+        wallWithGaps('h', START_Z, r.x0, r.x1, [[r.cx - sideGap, r.cx + sideGap]]);
+      }
+
+      const stub = 4.2 * mapScale;
+      const cornerX = 14 * mapScale;
+      const cornerZ = 8.5 * mapScale;
+      addWall(START_X - cornerX, START_Z - cornerZ, stub, TH);
+      addWall(START_X + cornerX, START_Z - cornerZ, stub, TH);
+      addWall(START_X - cornerX, START_Z + cornerZ, stub, TH);
+      addWall(START_X + cornerX, START_Z + cornerZ, stub, TH);
+    }
+
     const darkZones: Rect[] = []; // тёмных зон пока нет — карта изменилась
     const inDarkZone = (x: number, z: number) =>
       darkZones.some((d) => x >= d.minX && x <= d.maxX && z >= d.minZ && z <= d.maxZ);
@@ -576,6 +656,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // только сфера-свечение). Вмонтирован заподлицо в верхнюю стену северной
     // комнаты (сплошная стена севернее зала, грань z=-16.85), не мигает.
     const GEN_X = 9.5 * mapScale, GEN_Z = -17.9 * mapScale, GEN_Y = 2.0; // вдавлен в стену (масштаб карты)
+    const genSlots: { rect: Rect; used: boolean; reusable: boolean; fill: () => void }[] = [];
     const generator = new THREE.Group();
     // Сдвиг свечения вперёд: основание ореола ставим на южную (внутреннюю) грань
     // северной стены, чтобы НИ ОДНА полусфера не торчала за стену в открытое
@@ -623,7 +704,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     genLight.shadow.camera.far = 16;
     generator.add(genLight);
     generator.position.set(GEN_X, GEN_Y, GEN_Z);
-    scene.add(generator);
+    if (!onlyMoveSpider) scene.add(generator);
 
     // Плоский красный «глазок» на грани стены. MeshBasicMaterial не зависит от
     // света → круг всегда один и тот же насыщенный красный и вблизи, и издалека
@@ -633,7 +714,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       new THREE.MeshBasicMaterial({ color: 0xff0000 }),
     );
     eyeDisc.position.set(GEN_X, GEN_Y, -16.84 * mapScale); // на южной грани стены, лицом в зал
-    scene.add(eyeDisc);
+    if (!onlyMoveSpider) scene.add(eyeDisc);
 
     // красное световое пятно на полу под генератором (отблеск его свечения)
     const glowCanvas = document.createElement('canvas');
@@ -653,12 +734,210 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     );
     floorGlow.rotation.x = -Math.PI / 2;
     floorGlow.position.set(GEN_X, 0.03, GEN_Z + 3 * mapScale); // на полу, перед генератором (в зал)
-    scene.add(floorGlow);
+    if (!onlyMoveSpider) scene.add(floorGlow);
 
     // коллизия — игрок не проходит сквозь генератор
     const GEN_R = 1.2;
     const genRect: Rect = { minX: GEN_X - GEN_R, maxX: GEN_X + GEN_R, minZ: GEN_Z - GEN_R, maxZ: GEN_Z + GEN_R };
-    colliders.push(genRect);
+    const finalGate = new THREE.Group();
+    const finalGateLeft = new THREE.Group();
+    const finalGateRight = new THREE.Group();
+    if (!onlyMoveSpider) {
+      colliders.push(genRect);
+      genSlots.push({ rect: genRect, used: false, reusable: true, fill: () => undefined });
+    }
+
+    if (onlyMoveSpider) {
+      const pole = new THREE.Group();
+      const poleMetal = new THREE.MeshStandardMaterial({
+        color: 0x4f565d, metalness: 0.72, roughness: 0.34, envMapIntensity: 0.9,
+      });
+      const concreteMat = new THREE.MeshStandardMaterial({
+        color: 0x7b7770, metalness: 0.05, roughness: 0.86,
+      });
+      const darkMetal = new THREE.MeshStandardMaterial({
+        color: 0x22272c, metalness: 0.85, roughness: 0.3,
+      });
+      const ceramicMat = new THREE.MeshStandardMaterial({
+        color: 0xd7e2e8, emissive: 0x6aa9ff, emissiveIntensity: 0.1, metalness: 0.05, roughness: 0.28,
+      });
+      const electricMat = new THREE.MeshBasicMaterial({
+        color: 0x8ee8ff, transparent: true, opacity: 0.92,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      });
+
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(0.92, 1.18, 0.52, 8), concreteMat);
+      base.position.y = 0.21; base.castShadow = true; base.receiveShadow = true;
+      const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.28, 5.45, 16), poleMetal);
+      shaft.position.y = 2.95; shaft.castShadow = true; shaft.receiveShadow = true;
+      const serviceBox = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.78, 0.28), darkMetal);
+      serviceBox.position.set(0, 1.25, 0.24); serviceBox.castShadow = true;
+      pole.add(base, shaft, serviceBox);
+
+      for (const y of [0.78, 1.7, 2.72, 3.74]) {
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(0.29, 0.027, 8, 26), darkMetal);
+        ring.rotation.x = Math.PI / 2;
+        ring.position.y = y;
+        pole.add(ring);
+      }
+
+      const cross = new THREE.Mesh(new THREE.BoxGeometry(2.85, 0.18, 0.24), darkMetal);
+      cross.position.y = 5.05;
+      cross.castShadow = true;
+      pole.add(cross);
+
+      for (const side of [-1, 0, 1]) {
+        const armX = side * 1.08;
+        const insulator = new THREE.Group();
+        for (let i = 0; i < 4; i++) {
+          const disc = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.12, 0.1, 18), ceramicMat);
+          disc.rotation.x = Math.PI / 2;
+          disc.position.y = 5.22 + i * 0.12;
+          disc.position.x = armX;
+          disc.castShadow = true;
+          insulator.add(disc);
+        }
+        const cap = new THREE.Mesh(new THREE.SphereGeometry(0.12, 14, 10), ceramicMat);
+        cap.position.set(armX, 5.74, 0);
+        insulator.add(cap);
+        pole.add(insulator);
+      }
+
+      const makeLine = (points: THREE.Vector3[], material: THREE.Material) => {
+        pole.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), material));
+      };
+      const wireMat = new THREE.LineBasicMaterial({ color: 0x11171d, transparent: true, opacity: 0.95 });
+      for (const x of [-1.08, 0, 1.08]) {
+        makeLine([
+          new THREE.Vector3(x - 1.15, 5.66, -0.22),
+          new THREE.Vector3(x - 0.55, 5.52, -0.18),
+          new THREE.Vector3(x, 5.62, -0.15),
+          new THREE.Vector3(x + 0.55, 5.52, -0.18),
+          new THREE.Vector3(x + 1.15, 5.66, -0.22),
+        ], wireMat);
+      }
+      makeLine([
+        new THREE.Vector3(-1.08, 5.62, 0),
+        new THREE.Vector3(-0.78, 5.28, 0.16),
+        new THREE.Vector3(-0.36, 5.5, -0.08),
+        new THREE.Vector3(0, 5.16, 0.14),
+        new THREE.Vector3(0.34, 5.48, -0.12),
+        new THREE.Vector3(0.74, 5.24, 0.1),
+        new THREE.Vector3(1.08, 5.62, 0),
+      ], electricMat);
+      makeLine([
+        new THREE.Vector3(0, 5.62, 0),
+        new THREE.Vector3(0.18, 5.2, 0.18),
+        new THREE.Vector3(-0.12, 4.92, -0.08),
+        new THREE.Vector3(0.16, 4.58, 0.12),
+      ], electricMat);
+
+      const electricLight = new THREE.PointLight(0x8ee8ff, 7, 11 * mapScale, 2);
+      electricLight.position.set(0, 5.25, 0);
+      pole.add(electricLight);
+      pole.position.set(START_X, 0, START_Z);
+      scene.add(pole);
+
+      const generatorMat = new THREE.MeshStandardMaterial({
+        color: 0x220707, emissive: 0xff1800, emissiveIntensity: 1.1,
+        metalness: 0.75, roughness: 0.34,
+      });
+      const generatorTrim = new THREE.MeshStandardMaterial({
+        color: 0xe0b54a, emissive: 0x5a2600, emissiveIntensity: 0.25,
+        metalness: 0.9, roughness: 0.22,
+      });
+      const makeCornerGenerator = (x: number, z: number) => {
+        const g = new THREE.Group();
+        const holeMat = new THREE.MeshBasicMaterial({ color: 0x020101 });
+        const glowMat = new THREE.MeshBasicMaterial({
+          color: 0xff1d00, transparent: true, opacity: 0.78,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        });
+        const rimOuter = new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.105, 12, 48), generatorTrim);
+        rimOuter.rotation.x = Math.PI / 2;
+        rimOuter.position.y = 0.08;
+        rimOuter.castShadow = true;
+        const rimInner = new THREE.Mesh(new THREE.TorusGeometry(0.54, 0.045, 10, 42), generatorMat);
+        rimInner.rotation.x = Math.PI / 2;
+        rimInner.position.y = 0.11;
+        const hole = new THREE.Mesh(new THREE.CircleGeometry(0.72, 48), holeMat);
+        hole.rotation.x = -Math.PI / 2;
+        hole.position.y = 0.055;
+        const redCore = new THREE.Mesh(new THREE.CircleGeometry(0.5, 42), glowMat);
+        redCore.rotation.x = -Math.PI / 2;
+        redCore.position.y = 0.07;
+        const glow = new THREE.Mesh(new THREE.RingGeometry(0.62, 1.28, 48), glowMat);
+        glow.rotation.x = -Math.PI / 2;
+        glow.position.y = 0.035;
+        const light = new THREE.PointLight(0xff2200, 4.8, 7, 2);
+        light.position.y = 0.55;
+        g.add(glow, hole, redCore, rimOuter, rimInner, light);
+        g.position.set(x, 0, z);
+        scene.add(g);
+
+        let filled = false;
+        const fill = () => {
+          if (filled) return;
+          filled = true;
+          const battery = new THREE.Group();
+          const shell = new THREE.MeshStandardMaterial({ color: 0x23272e, metalness: 0.9, roughness: 0.3 });
+          const glowMat = new THREE.MeshStandardMaterial({
+            color: 0x36ff65, emissive: 0x36ff65, emissiveIntensity: 1.7,
+            metalness: 0.25, roughness: 0.35,
+          });
+          const body = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.9, 16), glowMat);
+          body.rotation.z = Math.PI / 2;
+          const capA = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.08, 16), shell);
+          capA.rotation.z = Math.PI / 2; capA.position.x = -0.49;
+          const capB = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.08, 16), shell);
+          capB.rotation.z = Math.PI / 2; capB.position.x = 0.49;
+          battery.add(body, capA, capB);
+          battery.position.set(0, 0.46, 0);
+          battery.rotation.z = -0.25;
+          battery.rotation.x = Math.PI / 2;
+          g.add(battery);
+        };
+
+        const r = 1.1;
+        const rect = { minX: x - r, maxX: x + r, minZ: z - r, maxZ: z + r };
+        genSlots.push({ rect, used: false, reusable: false, fill });
+      };
+      const cornerOffset = 5;
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          makeCornerGenerator(START_X + sx * cornerOffset, START_Z + sz * cornerOffset);
+        }
+      }
+
+      const gateMat = new THREE.MeshStandardMaterial({
+        color: 0x1c2229, metalness: 1, roughness: 0.24, emissive: 0x050607, emissiveIntensity: 0.25,
+      });
+      const gateGlow = new THREE.MeshStandardMaterial({
+        color: 0xff2600, emissive: 0xff2600, emissiveIntensity: 1.4, metalness: 0.4, roughness: 0.35,
+      });
+      const makeGateHalf = (side: -1 | 1) => {
+        const half = side < 0 ? finalGateLeft : finalGateRight;
+        for (let i = 0; i < 4; i++) {
+          const bar = new THREE.Mesh(new THREE.BoxGeometry(0.16, 3.6, 0.18), gateMat);
+          bar.position.set(side * (0.35 + i * 0.38), 1.8, 0);
+          bar.castShadow = true; bar.receiveShadow = true;
+          half.add(bar);
+        }
+        const railA = new THREE.Mesh(new THREE.BoxGeometry(1.55, 0.16, 0.22), gateMat);
+        railA.position.set(side * 0.92, 0.45, 0);
+        const railB = railA.clone();
+        railB.position.y = 3.15;
+        half.add(railA, railB);
+        const eye = new THREE.Mesh(new THREE.SphereGeometry(0.18, 14, 10), gateGlow);
+        eye.position.set(side * 0.92, 1.85, 0.18);
+        half.add(eye);
+        finalGate.add(half);
+      };
+      makeGateHalf(-1);
+      makeGateHalf(1);
+      finalGate.position.set(GEN_X, 0, GEN_Z + 1.15 * mapScale);
+      scene.add(finalGate);
+    }
 
     // ── Батарейки ──────────────────────────────────────────
     // Спавнятся ОДИН раз в начале по достижимым клеткам карты. Светятся зелёным,
@@ -712,7 +991,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
       g.position.set(x, 0.6, z);
       scene.add(g);
-      return { group: g, delivered: false, carried: false, locked: false };
+      return { group: g, delivered: false, carried: false, locked: false, pickupAbilityGiven: false, insertAbilityGiven: false };
     }
     // ── Переключатель = КНОПКА НА СТЕНЕ ────────────────────
     // Никуда нести не надо: подходишь к стене и жмёшь E. Красная кнопка с
@@ -848,6 +1127,11 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
     // ── Достижимые клетки с учётом альковов ────────────────
     const reach = computeReach();
+    const playerStart = onlyMoveSpider
+      ? (reach
+        .filter((c) => clearAt(c.x, c.z) >= 1.45 && !inCentral(c.x, c.z))
+        .sort((a, b) => Math.abs(b.x - START_X) - Math.abs(a.x - START_X))[0] ?? { x: START_X, z: START_Z })
+      : { x: START_X, z: START_Z };
     // выбрать n точек из пула с минимальным расстоянием между ними и от запретных
     function pickSpawns(n: number, avoid: { x: number; z: number }[], minSep: number) {
       const pool = shuffle(reach.filter((c) =>
@@ -932,10 +1216,18 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       scene.add(g);
       return { group: g, eaten: false };
     }
-    const meatGoal = 4 + levelNum; // мяса чуть больше с уровнем (голод тот же)
-    const meatPts = shuffle(reach.filter((c) =>
-      clearAt(c.x, c.z) >= 1.3 && Math.hypot(c.x - START_X, c.z - START_Z) > 6,
-    )).slice(0, meatGoal);
+    if (levelNum === 1 || onlyMoveSpider) ownedAbilRef.current = onlyMoveSpider ? ['move', 'climb'] : ['move'];
+    while (!onlyMoveSpider && ownedAbilRef.current.length < levelNum) {
+      const def = DEFAULT_ABIL_ORDER.find((a) => !ownedAbilRef.current.includes(a));
+      if (!def) break;
+      ownedAbilRef.current = [...ownedAbilRef.current, def];
+    }
+    hungerActive = ownedAbilRef.current.includes('hunger') && !onlyMoveSpider;
+    // мясо спавнится только когда голод активен как способность паука
+    const meatGoal = 4 + levelNum;
+    const meatPts = hungerActive
+      ? shuffle(reach.filter((c) => clearAt(c.x, c.z) >= 1.3 && Math.hypot(c.x - START_X, c.z - START_Z) > 6)).slice(0, meatGoal)
+      : [];
     const meats: Meat[] = meatPts.map((p) => makeMeat(p.x, p.z));
 
     // ── Игрок: белый человечек с руками и ногами ───────────
@@ -990,8 +1282,21 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     const rightArm = makeLimb(0.42, 1.6, 0.5, 0.11);
     const leftLeg = makeLimb(-0.18, 0.85, 0.55, 0.14);
     const rightLeg = makeLimb(0.18, 0.85, 0.55, 0.14);
+    const setPlayerRunPose = (phase: number, intensity = 1) => {
+      const s = Math.sin(phase);
+      const c = Math.cos(phase);
+      const armSwing = 1.05 * intensity;
+      const legSwing = 1.15 * intensity;
+      leftArm.rotation.x = s * armSwing;
+      rightArm.rotation.x = -s * armSwing;
+      leftLeg.rotation.x = -s * legSwing;
+      rightLeg.rotation.x = s * legSwing;
+      torso.rotation.x = -0.16 * intensity + Math.abs(c) * 0.04;
+      head.rotation.x = 0.08 * intensity;
+      player.position.y = Math.abs(c) * 0.14 * intensity;
+    };
 
-    player.position.set(START_X, 0, START_Z); // старт — ровно в центре центрального квадратного зала
+    player.position.set(playerStart.x, 0, playerStart.z);
     player.scale.setScalar(2);      // игрок в 2 раза больше (хитбокс — PLAYER_R ниже)
     scene.add(player);
 
@@ -1000,43 +1305,69 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // тактике игрока: HEAR (стой тихо) → SEE (прячься за стены) → SMELL (петляй) →
     // WEB (рви линию видимости) → CLONE (не загоняй себя в угол). Пауков может
     // быть несколько (клоны), поэтому держим МАССИВ экземпляров.
-    type SpiderLeg = { legG: THREE.Group; fem: THREE.Group; tib: THREE.Group; foot: THREE.Object3D; baseY: number; baseFemur: number; baseTibia: number; side: number; phase: number };
+    type SpiderLeg = {
+      legG: THREE.Group; fem: THREE.Group; tib: THREE.Group; foot: THREE.Object3D;
+      rootX: number; rootY: number; rootZ: number;
+      baseY: number; baseFemur: number; baseTibia: number; side: number; phase: number;
+    };
     type SpiderState = 'IDLE' | 'CHASE' | 'PATROL';
     type SpiderInst = {
-      group: THREE.Group; legs: SpiderLeg[]; touchR: number; legReach: number; bodyY: number;
+      group: THREE.Group; legs: SpiderLeg[]; touchR: number; legReach: number; bodyY: number; wallDrop: THREE.Object3D;
       heading: number; dist: number; bias: number;
       state: SpiderState; wpX: number; wpZ: number; // текущая путевая точка патруля
       stuck: number; lastX: number; lastZ: number;  // анти-залипание
       idleT: number;                                // таймер засады (IDLE)
+      wallClimb: number; wallNx: number; wallNz: number;
     };
     const spiders: SpiderInst[] = [];
     // радиус коллизии паука = по ширине его тела/коридора (растёт с картой), чтобы
     // он НЕ проходил сквозь стены телом, а полз вдоль/огибал их (как по стенам).
-    const SP_R = (CW - TH) / 2 * 0.7;
+    const finalSpiderScale = onlyMoveSpider ? 0.62 : 1;
+    const SP_R = (CW - TH) / 2 * 0.7 * finalSpiderScale;
 
     // АДАПТИВНЫЙ набор способностей паука (накоплен по тактикам игрока).
-    if (levelNum === 1) ownedAbilRef.current = ['move']; // новый забег — с чистого листа
+    if (levelNum === 1 || onlyMoveSpider) ownedAbilRef.current = onlyMoveSpider ? ['move', 'climb'] : ['move']; // новый забег — с чистого листа
     // возобновлённая игра (сейв на уровне N, но способностей меньше) → добираем по умолчанию
-    while (ownedAbilRef.current.length < levelNum) {
+    while (!onlyMoveSpider && ownedAbilRef.current.length < levelNum) {
       const def = DEFAULT_ABIL_ORDER.find((a) => !ownedAbilRef.current.includes(a));
       if (!def) break;
       ownedAbilRef.current = [...ownedAbilRef.current, def];
     }
     tacticRef.current = { still: 0, hide: 0, open: 0, flee: 0, loop: 0 }; // метрики тактик — заново
     const owned = ownedAbilRef.current;
+    hungerActive = owned.includes('hunger') && !onlyMoveSpider;
     const can = {
       hear:  owned.includes('hear'),
       see:   owned.includes('see'),
       smell: owned.includes('smell'),
       web:   owned.includes('web'),
       clone: owned.includes('clone'),
+      climb: owned.includes('climb'),
     };
-    setSpiderAbil(owned.map((k) => ABIL_META[k]).filter(Boolean)); // для HUD и заставки
+    const shownAbil = owned.filter((k) => k !== 'climb').map((k) => ABIL_META[k]).filter(Boolean);
+    setSpiderAbil(shownAbil); // для HUD и заставки
+    const refreshSpiderAbilityHud = () => {
+      const shown = ownedAbilRef.current.filter((k) => k !== 'climb').map((k) => ABIL_META[k]).filter(Boolean);
+      hungerActive = ownedAbilRef.current.includes('hunger') && !onlyMoveSpider;
+      setSpiderAbil(shown);
+    };
+    const unlockNextSpiderAbility = () => {
+      const order = onlyMoveSpider ? DEFAULT_ABIL_ORDER.filter((a) => a !== 'hunger' && a !== 'clone') : DEFAULT_ABIL_ORDER;
+      const add = order.find((a) => !ownedAbilRef.current.includes(a));
+      if (!add) return;
+      ownedAbilRef.current = [...ownedAbilRef.current, add];
+      if (add === 'hear') can.hear = true;
+      else if (add === 'see') can.see = true;
+      else if (add === 'smell') can.smell = true;
+      else if (add === 'web') can.web = true;
+      else if (add === 'clone') can.clone = true;
+      refreshSpiderAbilityHud();
+    };
 
     // дальности чувств (масштабируются вместе с картой)
-    const SEE_RANGE = 22 * mapScale;
+    const SEE_RANGE = 13 * mapScale;
     const HEAR_RANGE = 12 * mapScale; // слышит ШАГИ, когда игрок двигается рядом (сквозь стены)
-    const SMELL_RANGE = 12 * mapScale;
+    const SMELL_RANGE = 8 * mapScale;
     const WEB_RANGE = 18 * mapScale;
 
     // прямая видимость: между точками a и b нет стены
@@ -1075,7 +1406,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     let brainNext = BRAIN_EVERY;    // динамический интервал (растёт при 429/ошибке)
     let geminiOnline = false;        // удался ли последний запрос
     let geminiShown = false;        // дедуп React-стейта индикатора
-    let lastSeenX = START_X, lastSeenZ = START_Z, hasLastSeen = false; // где видели игрока
+    let lastSeenX = playerStart.x, lastSeenZ = playerStart.z, hasLastSeen = false; // где видели игрока
     // Ключ Gemini прямо из .env (VITE_GEMINI_API_KEY) → нейронка работает СРАЗУ,
     // без деплоя edge-функции. Если ключа нет — пойдём через безопасную функцию `ai`.
     // ⚠️ VITE_-ключ попадает в браузер; ок для локалки/личного билда, для прод —
@@ -1139,21 +1470,28 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       brainBusy = false;
     };
 
-    // снаряды-паутина (стрельба): при попадании замедляют игрока
-    type WebShot = { mesh: THREE.Mesh; vx: number; vz: number; life: number };
-    const webs: WebShot[] = [];
+    // Паутина-ловушка: пятно на полу. Наступил → медленнее, паук знает точку тревоги.
+    type WebTrap = { mesh: THREE.Mesh; x: number; z: number; r: number; life: number; triggered: boolean };
+    const webs: WebTrap[] = [];
     let webCd = 1.5;        // задержка перед первым выстрелом
     let webSlow = 0;        // сек. оставшегося замедления игрока
     let webbedShown = false; // чтобы не дёргать React-стейт каждый кадр
     let prevMx = 0, prevMz = 0; // прошлое направление игрока (для детекта петляния)
-    const makeWeb = (x: number, z: number, vx: number, vz: number) => {
+    const makeWeb = (x: number, z: number) => {
       const m = new THREE.Mesh(
-        new THREE.SphereGeometry(0.45, 12, 10),
-        new THREE.MeshStandardMaterial({ color: 0xf2f2f2, emissive: 0xcfcfcf, emissiveIntensity: 0.7, roughness: 0.6, metalness: 0 }),
+        new THREE.CircleGeometry(2.15, 36),
+        new THREE.MeshBasicMaterial({
+          color: 0xdfe8ee,
+          transparent: true,
+          opacity: 0.42,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        }),
       );
-      m.position.set(x, 1.4, z);
+      m.rotation.x = -Math.PI / 2;
+      m.position.set(x, 0.065, z);
       scene.add(m);
-      webs.push({ mesh: m, vx, vz, life: 3 });
+      webs.push({ mesh: m, x, z, r: 2.15, life: 18, triggered: false });
     };
 
     // клонирование (6-й уровень): периодически добавляется ещё паук
@@ -1168,6 +1506,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     const ESCAPE_RANGE = 24 * mapScale;  // дальше этого и не чует → выходит в PATROL
     const TURN_PATROL = 2.4;             // рад/с поворот в патруле (плавно)
     const TURN_CHASE = 4.2;              // рад/с поворот в погоне (резвее)
+    const ENABLE_WALL_CLIMB = can.climb; // финальная способность: паук перелезает через стены
 
     // ── Выравнивание по поверхности (raycast вниз) + глитч-фри ориентация ──
     // Луч вниз из точки над пауком находит поверхность под ним; «живот» паука
@@ -1186,6 +1525,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       const sp = S.group.position;
       // нормаль поверхности под пауком (готово к стенам; на полу = вверх)
       upN.set(0, 1, 0);
+      if (S.wallClimb <= 0) {
       RAY_ORIGIN.set(sp.x, sp.y + 3, sp.z);
       surfRay.set(RAY_ORIGIN, RAY_DIR); surfRay.far = 8;
       const hit = surfRay.intersectObjects(surfTargets, false)[0];
@@ -1194,6 +1534,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         if (n.y > 0.3) upN.copy(n).normalize(); // «пол-подобную» нормаль принимаем
       }
       // желаемый «вперёд» = по курсу, спроецирован на плоскость поверхности
+      }
       fwdN.set(Math.sin(S.heading), 0, Math.cos(S.heading)).projectOnPlane(upN);
       if (fwdN.lengthSq() < 1e-6) return;
       fwdN.normalize();
@@ -1207,6 +1548,32 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     // выбрать путевую точку патруля: достижимая клетка подальше, по возможности в
     // нужном направлении preferH (радианы). reach считается ниже — на момент вызова готов.
     const wrapPi = (a: number) => { while (a > Math.PI) a -= Math.PI * 2; while (a < -Math.PI) a += Math.PI * 2; return a; };
+    const nearestWall = (x: number, z: number, maxDist: number) => {
+      let best: { nx: number; nz: number; d: number; outer: boolean } | null = null;
+      for (const r of wallRects) {
+        const cx = Math.max(r.minX, Math.min(x, r.maxX));
+        const cz = Math.max(r.minZ, Math.min(z, r.maxZ));
+        let dx = x - cx, dz = z - cz;
+        let d = Math.hypot(dx, dz);
+        if (d < 1e-5) {
+          const left = Math.abs(x - r.minX), right = Math.abs(r.maxX - x);
+          const top = Math.abs(z - r.minZ), bottom = Math.abs(r.maxZ - z);
+          const m = Math.min(left, right, top, bottom);
+          if (m === left) { dx = -1; dz = 0; d = 0; }
+          else if (m === right) { dx = 1; dz = 0; d = 0; }
+          else if (m === top) { dx = 0; dz = -1; d = 0; }
+          else { dx = 0; dz = 1; d = 0; }
+        }
+        if (d > maxDist) continue;
+        const outer =
+          Math.abs(r.minX - bxMin) < 0.05 ||
+          Math.abs(r.maxX - bxMax) < 0.05 ||
+          Math.abs(r.minZ - bzMin) < 0.05 ||
+          Math.abs(r.maxZ - bzMax) < 0.05;
+        if (!best || d < best.d) best = { nx: dx / (d || 1), nz: dz / (d || 1), d, outer };
+      }
+      return best;
+    };
     const pickWaypoint = (fromX: number, fromZ: number, preferH: number | null) => {
       let best: { x: number; z: number } | null = null, bestScore = -Infinity;
       for (let t = 0; t < 26; t++) {
@@ -1227,7 +1594,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     function buildSpider() {
       // Ширина тела = ширина прохода коридора (≈ CW − TH), чтобы паук идеально
       // проходил в выход из центрального квадрата. По длине тело может быть больше.
-      const bodyR = (CW - TH) / 2 * 0.97; // полуширина ≈ половина прохода
+      const bodyR = (CW - TH) / 2 * 0.97 * finalSpiderScale; // полуширина ≈ половина прохода
       const diameter = bodyR * 2;
       const legLen = diameter * 1.8;      // длинные лапки
       // глянцевый металлически-красный (как на референсе)
@@ -1276,6 +1643,16 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       const abdomen = new THREE.Mesh(new THREE.SphereGeometry(bodyR * 0.72, 30, 24), redBody);
       abdomen.position.set(0, bodyR * 0.08, -bodyR * 0.75); abdomen.scale.set(0.82, 0.72, 1.3); abdomen.castShadow = true;
       s.add(cephalo, abdomen);
+      const wallDrop = new THREE.Group();
+      const dropBody = new THREE.Mesh(new THREE.CapsuleGeometry(bodyR * 0.34, WALL_H * 0.72, 6, 12), redBody);
+      dropBody.position.y = -WALL_H * 0.45;
+      dropBody.castShadow = true;
+      const dropTip = new THREE.Mesh(new THREE.SphereGeometry(bodyR * 0.38, 16, 12), redBody);
+      dropTip.position.y = -WALL_H * 0.86;
+      dropTip.castShadow = true;
+      wallDrop.add(dropBody, dropTip);
+      wallDrop.visible = false;
+      s.add(wallDrop);
       // опушка тела — много тонких волосков (детализация как на фото)
       furSphere(abdomen.position.x, abdomen.position.y, abdomen.position.z, bodyR * 0.72, abdomen.scale, 70, bodyR * 0.3, bodyR * 0.014);
       furSphere(cephalo.position.x, cephalo.position.y, cephalo.position.z, bodyR * 0.62, cephalo.scale, 34, bodyR * 0.2, bodyR * 0.012);
@@ -1322,7 +1699,10 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       for (const side of [-1, 1]) for (let i = 0; i < 4; i++) {
         const legG = new THREE.Group();
         const zOff = (i - 1.5) * (bodyR * 0.5);
-        legG.position.set(side * bodyR * 0.55, bodyR * 0.1, zOff);
+        const rootX = side * bodyR * 0.55;
+        const rootY = bodyR * 0.1;
+        const rootZ = zOff;
+        legG.position.set(rootX, rootY, rootZ);
         const femurAngle = -side * upAngle;                     // бедро вверх-наружу
         const fem = boneZ(femurLen, legLen * 0.04, legLen * 0.06, femurAngle, redLeg);
         const tibiaWorld = -side * (Math.PI - downExtra);       // голень вниз-наружу
@@ -1345,7 +1725,11 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         const group = (i % 2 === 0) ? 0 : Math.PI;
         const sideShift = side > 0 ? Math.PI : 0;
         const phase = group + sideShift + i * 0.18;
-        legs.push({ legG, fem: fem.g, tib: tib.g, foot: tib.tip, baseY, baseFemur: femurAngle, baseTibia, side, phase });
+        legs.push({
+          legG, fem: fem.g, tib: tib.g, foot: tib.tip,
+          rootX, rootY, rootZ,
+          baseY, baseFemur: femurAngle, baseTibia, side, phase,
+        });
       }
       s.position.y = -footY + 0.05; // ступни ровно на полу
       scene.add(s);
@@ -1353,7 +1737,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       const legReach = bodyR * 0.55
         + femurLen * Math.sin(upAngle)
         + tibiaLen * Math.sin(Math.PI - downExtra);
-      return { group: s, legs, touchR: bodyR, legReach, bodyY: s.position.y };
+      return { group: s, legs, touchR: bodyR, legReach, bodyY: s.position.y, wallDrop };
     }
     // создать паука в (x,z) с курсом heading и добавить в массив
     const spawnSpider = (x: number, z: number, heading: number) => {
@@ -1369,15 +1753,20 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         ...v, heading, dist: 0, bias,
         state: 'IDLE', wpX: wp.x, wpZ: wp.z,
         stuck: 0, lastX: p.x, lastZ: p.z, idleT: 0,
+        wallClimb: 0, wallNx: 0, wallNz: 1,
       });
     };
     // паук спавнится на ВСЕХ уровнях в СЛУЧАЙНОЙ достижимой точке подальше от
     // игрока (не всегда слева), курсом в случайную сторону.
     {
-      const far = reach.filter((c) => Math.hypot(c.x - START_X, c.z - START_Z) > 18 * mapScale && clearAt(c.x, c.z) >= SP_R + 0.3);
-      const pool = far.length ? far : reach;
-      const cell = pool.length ? pool[Math.floor(Math.random() * pool.length)] : { x: minWX + SP_R + 1.2, z: 0 };
-      spawnSpider(cell.x, cell.z, Math.random() * Math.PI * 2);
+      if (onlyMoveSpider) {
+        spawnSpider(START_X, START_Z, Math.random() * Math.PI * 2);
+      } else {
+        const far = reach.filter((c) => Math.hypot(c.x - START_X, c.z - START_Z) > 18 * mapScale && clearAt(c.x, c.z) >= SP_R + 0.3);
+        const pool = far.length ? far : reach;
+        const cell = pool.length ? pool[Math.floor(Math.random() * pool.length)] : { x: minWX + SP_R + 1.2, z: 0 };
+        spawnSpider(cell.x, cell.z, Math.random() * Math.PI * 2);
+      }
     }
 
     // ── Клавиатура ─────────────────────────────────────────
@@ -1444,6 +1833,239 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       } catch { /* нет WebAudio */ }
     };
 
+    type FinalLightning = { line: THREE.Line; life: number };
+    type FinalPiece = { mesh: THREE.Object3D; velocity: THREE.Vector3; spin: THREE.Vector3; life: number };
+    type FinalShock = { mesh: THREE.Mesh; light: THREE.PointLight; life: number; maxLife: number };
+    const finalCutscene = {
+      active: false,
+      t: 0,
+      ended: false,
+      burstDone: false,
+      bloodDone: false,
+      burstShake: 0,
+      lightnings: [] as FinalLightning[],
+      pieces: [] as FinalPiece[],
+      shocks: [] as FinalShock[],
+      blood: [] as THREE.Object3D[],
+    };
+    const makeLightningLine = (from: THREE.Vector3, to: THREE.Vector3, color = 0xfff06a, life = 0.22) => {
+      const pts: THREE.Vector3[] = [from.clone()];
+      for (let i = 1; i < 5; i++) {
+        const t = i / 5;
+        pts.push(new THREE.Vector3(
+          from.x + (to.x - from.x) * t + (Math.random() - 0.5) * 1.2,
+          from.y + (to.y - from.y) * t + (Math.random() - 0.5) * 0.9,
+          from.z + (to.z - from.z) * t + (Math.random() - 0.5) * 1.2,
+        ));
+      }
+      pts.push(to.clone());
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(pts),
+        new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.95 }),
+      );
+      scene.add(line);
+      finalCutscene.lightnings.push({ line, life });
+    };
+    const addSpiderPieces = (x: number, z: number) => {
+      const mat = new THREE.MeshStandardMaterial({ color: 0x8b0905, emissive: 0x350000, emissiveIntensity: 0.8, roughness: 0.72 });
+      for (let i = 0; i < 38; i++) {
+        const piece = new THREE.Mesh(
+          i % 4 === 0
+            ? new THREE.CapsuleGeometry(0.12, 0.75, 4, 8)
+            : i % 4 === 1
+              ? new THREE.BoxGeometry(0.22 + Math.random() * 0.38, 0.16 + Math.random() * 0.32, 0.22 + Math.random() * 0.38)
+              : new THREE.SphereGeometry(0.16 + Math.random() * 0.26, 10, 8),
+          mat,
+        );
+        const a = Math.random() * Math.PI * 2;
+        const r = Math.random() * 0.85;
+        piece.position.set(x + Math.cos(a) * r, 1.1 + Math.random() * 1.6, z + Math.sin(a) * r);
+        piece.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+        piece.castShadow = true;
+        scene.add(piece);
+        const speed = 7 + Math.random() * 9;
+        finalCutscene.pieces.push({
+          mesh: piece,
+          velocity: new THREE.Vector3(Math.cos(a) * speed, 5 + Math.random() * 8, Math.sin(a) * speed),
+          spin: new THREE.Vector3((Math.random() - 0.5) * 13, (Math.random() - 0.5) * 13, (Math.random() - 0.5) * 13),
+          life: 4.2,
+        });
+      }
+    };
+    const addSpiderBurst = (x: number, z: number) => {
+      const light = new THREE.PointLight(0xfff2aa, 9, 30);
+      light.position.set(x, 3.2, z);
+      scene.add(light);
+
+      const shockMat = new THREE.MeshBasicMaterial({
+        color: 0xfff2aa,
+        transparent: true,
+        opacity: 0.82,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const shock = new THREE.Mesh(new THREE.TorusGeometry(1, 0.08, 8, 72), shockMat);
+      shock.position.set(x, 0.18, z);
+      shock.rotation.x = Math.PI / 2;
+      scene.add(shock);
+      finalCutscene.shocks.push({ mesh: shock, light, life: 0.75, maxLife: 0.75 });
+
+      const top = new THREE.Vector3(x, 8, z);
+      for (let i = 0; i < 7; i++) {
+        const a = (i / 7) * Math.PI * 2 + Math.random() * 0.35;
+        makeLightningLine(top, new THREE.Vector3(x + Math.cos(a) * (4 + Math.random() * 5), 0.55, z + Math.sin(a) * (4 + Math.random() * 5)), 0xfff2aa, 0.34);
+      }
+      finalCutscene.burstShake = 0.9;
+    };
+    const addSpiderBloodToPlayer = () => {
+      const mat = new THREE.MeshBasicMaterial({ color: 0x7a0503, transparent: true, opacity: 0.86 });
+      for (let i = 0; i < 14; i++) {
+        const drop = new THREE.Mesh(new THREE.SphereGeometry(0.06 + Math.random() * 0.08, 8, 6), mat);
+        drop.position.set((Math.random() - 0.5) * 0.75, 1.0 + Math.random() * 1.3, 0.32 + Math.random() * 0.28);
+        player.add(drop);
+        finalCutscene.blood.push(drop);
+      }
+    };
+    const startFinalCutscene = () => {
+      if (finalCutscene.active || finalCutscene.ended) return;
+      finalCutscene.active = true;
+      finalCutscene.t = 0;
+      finalCutscene.burstDone = false;
+      finalCutscene.bloodDone = false;
+      finalCutscene.burstShake = 0;
+      setPaused(false);
+      pausedRef.current = false;
+      setFinalEnding(false);
+      try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
+    };
+    const updateFinalCutscene = (dt: number) => {
+      finalCutscene.t += dt;
+      const t = finalCutscene.t;
+      const centerX = START_X;
+      const centerZ = START_Z;
+      const poleTop = new THREE.Vector3(centerX, 5.2, centerZ);
+      const spider = spiders[0];
+      const runR = 6.2 * mapScale;
+
+      if (t < 5) {
+        const a = t * 1.9;
+        player.visible = true;
+        player.position.set(centerX + Math.cos(a) * runR, 0, centerZ + Math.sin(a) * runR);
+        faceAngle = Math.atan2(-Math.sin(a), Math.cos(a));
+        player.rotation.y = faceAngle;
+        setPlayerRunPose(t * 13.5, 1);
+        if (spider) {
+          spider.group.visible = true;
+          spider.group.position.set(centerX + Math.cos(a - 0.85) * runR, spider.bodyY, centerZ + Math.sin(a - 0.85) * runR);
+          spider.heading = Math.atan2(player.position.x - spider.group.position.x, player.position.z - spider.group.position.z);
+          spider.group.rotation.y = spider.heading;
+        }
+        if (Math.random() < 0.55) {
+          const a2 = Math.random() * Math.PI * 2;
+          makeLightningLine(poleTop, new THREE.Vector3(centerX + Math.cos(a2) * (7 + Math.random() * 7), 0.45, centerZ + Math.sin(a2) * (7 + Math.random() * 7)), 0xffd84a, 0.18);
+        }
+        camera.position.set(centerX, 18, centerZ + 18);
+        camera.lookAt(centerX, 1.2, centerZ);
+      } else if (t < 8) {
+        if (firstPersonRef.current !== true) setFirstPerson(true);
+        player.visible = false;
+        faceAngle = Math.atan2(centerX - player.position.x, centerZ - player.position.z);
+        const eyeH = 3.6;
+        const fx = Math.sin(faceAngle), fz = Math.cos(faceAngle);
+        camera.position.set(player.position.x + fx * 0.3, eyeH, player.position.z + fz * 0.3);
+        camera.lookAt(centerX, 3.0, centerZ);
+        if (spider) {
+          const sp = spider.group.position;
+          if (Math.random() < 0.95) makeLightningLine(poleTop, new THREE.Vector3(sp.x, sp.y + 1.4, sp.z), 0xffffaa, 0.16);
+          if (t > 7 && !finalCutscene.burstDone) {
+            finalCutscene.burstDone = true;
+            playScream();
+            spider.group.visible = false;
+            addSpiderBurst(sp.x, sp.z);
+            addSpiderPieces(sp.x, sp.z);
+            addSpiderBloodToPlayer();
+          }
+        }
+      } else if (t < 12) {
+        if (!finalCutscene.bloodDone) {
+          finalCutscene.bloodDone = true;
+          setFirstPerson(false);
+          player.visible = true;
+        }
+        const u = Math.min(1, (t - 8) / 4);
+        const startX = centerX + runR * 0.35;
+        const startZ = centerZ + runR * 0.5;
+        player.position.set(startX + (GEN_X - startX) * u, 0, startZ + ((GEN_Z + 2.4 * mapScale) - startZ) * u);
+        faceAngle = Math.atan2(GEN_X - player.position.x, (GEN_Z + 2.4 * mapScale) - player.position.z);
+        player.rotation.y = faceAngle;
+        setPlayerRunPose((t - 8) * 15, 1);
+        finalGateLeft.position.x = -1.8 * u;
+        finalGateRight.position.x = 1.8 * u;
+        camera.position.set(player.position.x, 13, player.position.z + 8);
+        camera.lookAt(player.position.x, 1.2, player.position.z - 2);
+      } else {
+        finalCutscene.active = false;
+        finalCutscene.ended = true;
+        setFinalEnding(true);
+      }
+
+      if (finalCutscene.burstShake > 0) {
+        const s = finalCutscene.burstShake;
+        camera.position.x += (Math.random() - 0.5) * s * 0.55;
+        camera.position.y += (Math.random() - 0.5) * s * 0.35;
+        camera.position.z += (Math.random() - 0.5) * s * 0.55;
+        finalCutscene.burstShake = Math.max(0, s - dt * 1.8);
+      }
+
+      for (let i = finalCutscene.pieces.length - 1; i >= 0; i--) {
+        const p = finalCutscene.pieces[i];
+        p.life -= dt;
+        p.velocity.y -= 12 * dt;
+        p.velocity.multiplyScalar(1 - dt * 0.18);
+        p.mesh.position.addScaledVector(p.velocity, dt);
+        p.mesh.rotation.x += p.spin.x * dt;
+        p.mesh.rotation.y += p.spin.y * dt;
+        p.mesh.rotation.z += p.spin.z * dt;
+        if (p.mesh.position.y < 0.28) {
+          p.mesh.position.y = 0.28;
+          p.velocity.y = Math.abs(p.velocity.y) * 0.32;
+          p.velocity.x *= 0.68;
+          p.velocity.z *= 0.68;
+        }
+        if (p.life <= 0) finalCutscene.pieces.splice(i, 1);
+      }
+
+      for (let i = finalCutscene.shocks.length - 1; i >= 0; i--) {
+        const s = finalCutscene.shocks[i];
+        s.life -= dt;
+        const k = 1 - Math.max(0, s.life) / s.maxLife;
+        s.mesh.scale.setScalar(1 + k * 8);
+        const mat = s.mesh.material as THREE.MeshBasicMaterial;
+        mat.opacity = Math.max(0, 0.82 * (1 - k));
+        s.light.intensity = Math.max(0, 9 * (1 - k));
+        if (s.life <= 0) {
+          scene.remove(s.mesh);
+          scene.remove(s.light);
+          s.mesh.geometry.dispose();
+          mat.dispose();
+          finalCutscene.shocks.splice(i, 1);
+        }
+      }
+
+      for (let i = finalCutscene.lightnings.length - 1; i >= 0; i--) {
+        const l = finalCutscene.lightnings[i];
+        l.life -= dt;
+        const mat = l.line.material as THREE.LineBasicMaterial;
+        mat.opacity = Math.max(0, l.life / 0.22);
+        if (l.life <= 0) {
+          scene.remove(l.line);
+          l.line.geometry.dispose();
+          mat.dispose();
+          finalCutscene.lightnings.splice(i, 1);
+        }
+      }
+    };
+
     // Проверка завершения уровня: ВСЕ батарейки доставлены И ВСЕ переключатели
     // дёрнуты. Если батарейки готовы, а переключатель нет — уровень не пройден.
     function tryComplete() {
@@ -1451,9 +2073,23 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       if (collectedCount < batteryGoal || switchesActive < switchGoal) return;
       finished = true;
       try { localStorage.removeItem(SAVE_KEY); } catch { /* нет localStorage */ }
-      if (levelNum >= LEVELS) { setWon(true); }       // последний уровень → победа
+      if (levelNum >= LEVELS) { startFinalCutscene(); }       // последний уровень → финальная катсцена
       else { setLevelCleared(true); }                  // иначе → экран «уровень пройден»
     }
+
+    const activateNearestSwitch = () => {
+      for (const sw of switchesArr) {
+        if (sw.active) continue;
+        if (Math.hypot(sw.x - player.position.x, sw.z - player.position.z) < 3.4) {
+          sw.active = true; sw.setActive(true);
+          switchesActive++; setSwitchesOn(switchesActive);
+          playSiren(); tryComplete();
+          if (can.hear) { noiseAlert = NOISE_HEARD; noiseX = player.position.x; noiseZ = player.position.z; }
+          break;
+        }
+      }
+    };
+    switchFnRef.current = activateNearestSwitch;
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (!startedRef.current) return; // на меню клавиши игнорируются
@@ -1463,26 +2099,28 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         setPaused(pausedRef.current);
         return;
       }
-      if (e.code === 'KeyM') mapView = !mapView;
-      if (e.code === 'KeyQ') dropFnRef.current?.(); // выбросить батарейку
-      if (e.code === 'KeyE') { // дёрнуть ближайший переключатель → сирена
-        for (const sw of switchesArr) {
-          if (sw.active) continue;
-          if (Math.hypot(sw.x - player.position.x, sw.z - player.position.z) < 3.4) {
-            sw.active = true; sw.setActive(true);
-            switchesActive++; setSwitchesOn(switchesActive);
-            playSiren(); tryComplete();
-            // сирена — громкий шум: паук со слухом услышит через всю карту
-            if (can.hear) { noiseAlert = NOISE_HEARD; noiseX = player.position.x; noiseZ = player.position.z; }
-            break;
-          }
-        }
+      if (e.code === 'KeyM') {
+        mapView = !mapView;
+        document.exitPointerLock?.();
       }
+      if (e.code === 'KeyQ') dropFnRef.current?.(); // выбросить батарейку
+      if (e.code === 'KeyE') activateNearestSwitch(); // дёрнуть ближайший переключатель → сирена
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
     };
     const onKeyUp = (e: KeyboardEvent) => { keys[e.code] = false; };
+    const onMouseMove = (e: MouseEvent) => {
+      if (!firstPersonRef.current || document.pointerLockElement !== renderer.domElement) return;
+      if (!startedRef.current || introRef.current || pausedRef.current || mapView || finished) return;
+      faceAngle -= e.movementX * FIRST_PERSON_MOUSE_SENS;
+    };
+    const onCanvasClick = () => {
+      if (!firstPersonRef.current || !startedRef.current || introRef.current || pausedRef.current || mapView || finished) return;
+      renderer.domElement.requestPointerLock?.();
+    };
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('mousemove', onMouseMove);
+    renderer.domElement.addEventListener('click', onCanvasClick);
 
     // ── Коллизия ───────────────────────────────────────────
     const PLAYER_R = 1.2;   // хитбокс в 2 раза больше прежних 0.6
@@ -1516,6 +2154,8 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     const clock = new THREE.Clock();
     let frameId = 0;
     let faceAngle = 0;
+    const FIRST_PERSON_MOUSE_SENS = 0.0026;
+    const FIRST_PERSON_KEY_TURN = 2.5;
     let vision = NORMAL_VISION;
     let walkPhase = 0;
     let walkAmt = 0; // 0 — стоит, 1 — идёт (для плавного старта/стопа)
@@ -1524,11 +2164,13 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     let carrying: Battery | null = null; // батарейка в руках (или null)
     let collectedCount = 0;              // сколько доставлено в генератор
 
-    // ── Голод ──
+    // ── Голод (целые единицы сытости) ──
     const SATIETY_MAX = 3;               // максимум сытости (и старт)
-    const HUNGER_RATE = 1 / 15;          // теряем 1 сытость за ~15 c → полный бар ≈ 45 c
-    let satietyVal = SATIETY_MAX;        // текущая сытость (плавная)
-    let satietyShownT = 0;               // как давно обновляли HUD-стейт
+    const HUNGER_INTERVAL = 30;          // −1 сытость каждые 30 c → полный запас ≈ 90 c
+    const MEAT_SPAWN_INTERVAL = 30;      // новое мясо появляется каждые 30 c
+    let satietyVal = SATIETY_MAX;        // текущая сытость (целое 0..3)
+    let hungerTimer = 0;                 // секунд с прошлого «минус сытость»
+    let meatSpawnTimer = 0;              // секунд с прошлого нового мяса
     setSatiety(SATIETY_MAX);             // сброс HUD на старте уровня
 
     // Выбросить батарейку: кладём её обратно на пол под игроком.
@@ -1561,7 +2203,10 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         const sv = JSON.parse(raw) as {
           level?: number; collected?: number; carryingIndex?: number | null;
           player?: { x: number; z: number; face: number };
-          batteries?: { x: number; z: number; delivered: boolean; carried: boolean }[];
+          batteries?: {
+            x: number; z: number; delivered: boolean; carried: boolean;
+            abilityGiven?: boolean; pickupAbilityGiven?: boolean; insertAbilityGiven?: boolean;
+          }[];
           switches?: boolean[];
         };
         // сохранение от ДРУГОГО уровня (например только {level}) — спавн оставляем свежим
@@ -1582,6 +2227,12 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
             if (!b) return;
             b.delivered = !!sb.delivered;
             b.carried = !!sb.carried;
+            b.pickupAbilityGiven = !!(sb.pickupAbilityGiven ?? sb.abilityGiven);
+            b.insertAbilityGiven = !!sb.insertAbilityGiven;
+            if (onlyMoveSpider) {
+              if (b.pickupAbilityGiven) unlockNextSpiderAbility();
+              if (b.insertAbilityGiven) unlockNextSpiderAbility();
+            }
             if (b.delivered) scene.remove(b.group);
             else b.group.position.set(sb.x, sb.carried ? 2.0 : 0.55, sb.z);
           });
@@ -1595,6 +2246,16 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       }
     } catch { /* нет localStorage или битое сохранение */ }
 
+    if (onlyMoveSpider && collectedCount > 0) {
+      let filledSlots = 0;
+      for (const slot of genSlots) {
+        if (slot.reusable || filledSlots >= collectedCount) continue;
+        slot.used = true;
+        slot.fill();
+        filledSlots++;
+      }
+    }
+
     // снимок текущего состояния для сохранения (вызывается из кнопок паузы)
     getStateRef.current = () => ({
       level: levelNum,
@@ -1603,6 +2264,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       player: { x: player.position.x, z: player.position.z, face: faceAngle },
       batteries: batteries.map((b) => ({
         x: b.group.position.x, z: b.group.position.z, delivered: b.delivered, carried: b.carried,
+        pickupAbilityGiven: b.pickupAbilityGiven, insertAbilityGiven: b.insertAbilityGiven,
       })),
       switches: switchesArr.map((s) => s.active),
     });
@@ -1612,11 +2274,26 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       const dt = Math.min(clock.getDelta(), 0.05);
       if (pausedRef.current) { renderer.render(scene, camera); return; } // на паузе — заморозка
       if (deadFlag) { renderer.render(scene, camera); return; }          // смерть — заморозка
+      if (finalCutscene.active) { updateFinalCutscene(dt); renderer.render(scene, camera); return; }
 
       const webMul = webSlow > 0 ? 0.45 : 1; // опутан паутиной → медленнее
       const speed = (carrying ? 5 * 0.67 : 5) * webMul; // с батарейкой ещё на 33% медленнее
-      let mx = (keys['KeyD'] || keys['ArrowRight'] ? 1 : 0) - (keys['KeyA'] || keys['ArrowLeft'] ? 1 : 0);
-      let mz = (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0) - (keys['KeyW'] || keys['ArrowUp'] ? 1 : 0);
+      const touchMove = mobileInputRef.current;
+      let mx = 0;
+      let mz = 0;
+      if (firstPersonRef.current && !mapView) {
+        const turn = (keys['ArrowRight'] ? 1 : 0) - (keys['ArrowLeft'] ? 1 : 0);
+        faceAngle -= turn * FIRST_PERSON_KEY_TURN * dt;
+        const strafe = (keys['KeyD'] ? 1 : 0) - (keys['KeyA'] ? 1 : 0) + touchMove.mx;
+        const forward = (keys['KeyW'] || keys['ArrowUp'] ? 1 : 0) - (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0) - touchMove.mz;
+        const fx = Math.sin(faceAngle), fz = Math.cos(faceAngle);
+        const rx = Math.cos(faceAngle), rz = -Math.sin(faceAngle);
+        mx = fx * forward + rx * strafe;
+        mz = fz * forward + rz * strafe;
+      } else {
+        mx = (keys['KeyD'] || keys['ArrowRight'] ? 1 : 0) - (keys['KeyA'] || keys['ArrowLeft'] ? 1 : 0) + touchMove.mx;
+        mz = (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0) - (keys['KeyW'] || keys['ArrowUp'] ? 1 : 0) + touchMove.mz;
+      }
       // на меню и на заставке игрок стоит (сцена = фон)
       if (!startedRef.current || introRef.current) { mx = 0; mz = 0; }
       const len = Math.hypot(mx, mz);
@@ -1626,7 +2303,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         mx /= len; mz /= len;
         player.position.x += mx * speed * dt;
         player.position.z += mz * speed * dt;
-        faceAngle = Math.atan2(mx, mz);
+        if (!firstPersonRef.current || mapView) faceAngle = Math.atan2(mx, mz);
       }
       player.rotation.y = faceAngle;
       resolveCollision(player.position);
@@ -1635,19 +2312,30 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
       if (carrying) {
         // несём батарейку чуть впереди игрока (в направлении взгляда)
         const fx = Math.sin(faceAngle), fz = Math.cos(faceAngle);
+        const side = firstPersonRef.current ? 0.55 : 0;
+        const front = firstPersonRef.current ? 1.05 : 1.4;
+        const holdY = firstPersonRef.current ? 1.25 : 2.0;
         carrying.group.position.set(
-          player.position.x + fx * 1.4,
-          2.0,
-          player.position.z + fz * 1.4,
+          player.position.x + fx * front + Math.cos(faceAngle) * side,
+          holdY,
+          player.position.z + fz * front - Math.sin(faceAngle) * side,
         );
         carrying.group.rotation.y = faceAngle;
         // доставка: коллизия батарейки касается коллизии генератора → исчезает
         const bx = carrying.group.position.x, bz = carrying.group.position.z, hb = 0.5;
-        if (
-          bx + hb > genRect.minX && bx - hb < genRect.maxX &&
-          bz + hb > genRect.minZ && bz - hb < genRect.maxZ
-        ) {
+        const hitSlot = genSlots.find((s) =>
+          (s.reusable || !s.used) &&
+          bx + hb > s.rect.minX && bx - hb < s.rect.maxX &&
+          bz + hb > s.rect.minZ && bz - hb < s.rect.maxZ
+        );
+        if (hitSlot) {
+          hitSlot.used = true;
+          hitSlot.fill();
           scene.remove(carrying.group);
+          if (onlyMoveSpider && !carrying.insertAbilityGiven) {
+            carrying.insertAbilityGiven = true;
+            unlockNextSpiderAbility();
+          }
           carrying.delivered = true;
           carrying = null;
           collectedCount++;
@@ -1665,6 +2353,10 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           if (b.locked) { if (!near) b.locked = false; continue; }
           if (near) {
             b.carried = true;
+            if (onlyMoveSpider && !b.pickupAbilityGiven) {
+              b.pickupAbilityGiven = true;
+              unlockNextSpiderAbility();
+            }
             carrying = b;
             break;
           }
@@ -1675,27 +2367,43 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         if (!b.delivered && !b.carried) b.group.rotation.y += dt * 1.5;
       }
 
-      // ── ГОЛОД: сытость убывает со временем; мясо её восстанавливает ──
-      if (startedRef.current && !introRef.current && !finished) {
-        satietyVal = Math.max(0, satietyVal - HUNGER_RATE * dt);
-        // подбор мяса касанием → +1 сытость (до максимума)
+      // ── ГОЛОД (способность паука, со 2-го уровня): сытость тает; мясо её восполняет ──
+      if (hungerActive && startedRef.current && !introRef.current && !finished) {
+        // тик голода: −1 сытость каждые HUNGER_INTERVAL секунд
+        hungerTimer += dt;
+        if (hungerTimer >= HUNGER_INTERVAL) {
+          hungerTimer -= HUNGER_INTERVAL;
+          satietyVal = Math.max(0, satietyVal - 1);
+          setSatiety(satietyVal);
+        }
+        meatSpawnTimer += dt;
+        if (meatSpawnTimer >= MEAT_SPAWN_INTERVAL) {
+          meatSpawnTimer -= MEAT_SPAWN_INTERVAL;
+          const meatSpawnPts = reach.filter((c) =>
+            clearAt(c.x, c.z) >= 1.3 &&
+            Math.hypot(c.x - player.position.x, c.z - player.position.z) > 8 &&
+            meats.every((m) => m.eaten || Math.hypot(m.group.position.x - c.x, m.group.position.z - c.z) > 5)
+          );
+          const p = meatSpawnPts.length ? meatSpawnPts[Math.floor(Math.random() * meatSpawnPts.length)] : null;
+          if (p) meats.push(makeMeat(p.x, p.z));
+        }
+        // подбор мяса касанием → +1 сытость. ПРИ ПОЛНОЙ (3) НЕ берём (не тратим).
         for (const m of meats) {
           if (m.eaten) continue;
           const mdx = m.group.position.x - player.position.x;
           const mdz = m.group.position.z - player.position.z;
-          if (mdx * mdx + mdz * mdz < PICKUP_R * PICKUP_R) {
+          if (mdx * mdx + mdz * mdz < PICKUP_R * PICKUP_R && satietyVal < SATIETY_MAX) {
             m.eaten = true; scene.remove(m.group);
             satietyVal = Math.min(SATIETY_MAX, satietyVal + 1);
-          } else {
+            hungerTimer = 0;          // поел — таймер до следующего минуса заново
+            setSatiety(satietyVal);
+          } else if (!m.eaten) {
             m.group.rotation.y += dt * 1.2; // лёгкое вращение, заметнее в темноте
           }
         }
-        // обновляем HUD-стейт несколько раз в секунду (не каждый кадр)
-        satietyShownT += dt;
-        if (satietyShownT > 0.2) { satietyShownT = 0; setSatiety(satietyVal); }
         // сытость кончилась → смерть от голода
         if (satietyVal <= 0) {
-          deadFlag = true; finished = true; setSatiety(0); setStarved(true);
+          deadFlag = true; finished = true; setStarved(true);
         }
       }
 
@@ -1725,7 +2433,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           if (scent.length > 8) scent.shift(); // ~2 с лага → петляя, сбиваешь след
         }
         // CLONE: периодически добавляется ещё паук (подальше от игрока)
-        if (can.clone && spiders.length < MAX_SPIDERS) {
+        if (can.clone && !onlyMoveSpider && spiders.length < MAX_SPIDERS) {
           cloneCd -= dt;
           if (cloneCd <= 0) {
             cloneCd = 12;
@@ -1741,24 +2449,36 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           const dx = player.position.x - sp0.x, dz = player.position.z - sp0.z;
           const d = Math.hypot(dx, dz);
           if (d < WEB_RANGE && d > 2 && hasLOS(sp0.x, sp0.z, player.position.x, player.position.z)) {
-            webCd = 2.6;
-            const sv = 16;
-            makeWeb(sp0.x, sp0.z, (dx / d) * sv, (dz / d) * sv);
+            webCd = 4.2;
+            const trapDist = Math.max(2.4, d - 1.8);
+            makeWeb(sp0.x + (dx / d) * trapDist, sp0.z + (dz / d) * trapDist);
           }
         }
         // затухание «слышу сирену»
         if (noiseAlert > 0) noiseAlert = Math.max(0, noiseAlert - dt);
-        // полёт снарядов-паутины: попал в игрока → замедление, в стену → исчез
+        // Паутина-ловушка: наступил в зону → замедление + паук знает, где ты.
         if (webSlow > 0) webSlow = Math.max(0, webSlow - dt);
         for (let i = webs.length - 1; i >= 0; i--) {
           const w = webs[i];
-          w.mesh.position.x += w.vx * dt; w.mesh.position.z += w.vz * dt;
           w.life -= dt;
-          const hx = w.mesh.position.x - player.position.x, hz = w.mesh.position.z - player.position.z;
-          const hitPlayer = hx * hx + hz * hz < (PLAYER_R + 0.5) * (PLAYER_R + 0.5);
-          const hitWall = clearAt(w.mesh.position.x, w.mesh.position.z) < 0.3;
-          if (hitPlayer) webSlow = 3.0;
-          if (hitPlayer || hitWall || w.life <= 0) { scene.remove(w.mesh); webs.splice(i, 1); }
+          const hx = w.x - player.position.x, hz = w.z - player.position.z;
+          const hitPlayer = hx * hx + hz * hz < (w.r + PLAYER_R * 0.4) * (w.r + PLAYER_R * 0.4);
+          if (hitPlayer) {
+            webSlow = 4.0;
+            if (!w.triggered) {
+              w.triggered = true;
+              noiseAlert = NOISE_HEARD;
+              noiseX = player.position.x;
+              noiseZ = player.position.z;
+              lastSeenX = player.position.x;
+              lastSeenZ = player.position.z;
+              hasLastSeen = true;
+              for (const S of spiders) S.state = 'CHASE';
+            }
+          }
+          const mat = w.mesh.material as THREE.MeshBasicMaterial;
+          mat.opacity = w.triggered ? 0.58 : 0.34 + Math.sin(performance.now() * 0.006) * 0.08;
+          if (w.life <= 0) { scene.remove(w.mesh); webs.splice(i, 1); }
         }
         if ((webSlow > 0) !== webbedShown) { webbedShown = webSlow > 0; setWebbed(webbedShown); }
 
@@ -1783,7 +2503,10 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           } else if (can.hear && moving && distP < HEAR_RANGE) {
             sensed = true; senseH = Math.atan2(dx, dz);                      // СЛЫШИТ шаги вблизи
           } else if (can.smell && distP < SMELL_RANGE && scent.length) {
-            const sc = scent[0]; sensed = true; senseH = Math.atan2(sc.x - sp.x, sc.z - sp.z); // НЮХ
+            const sc = scent[0];
+            if (hasLOS(sp.x, sp.z, sc.x, sc.z)) {
+              sensed = true; senseH = Math.atan2(sc.x - sp.x, sc.z - sp.z); // НЮХ
+            }
           }
           if (sensed) { packSensed = true; lastSeenX = player.position.x; lastSeenZ = player.position.z; hasLastSeen = true; }
 
@@ -1827,14 +2550,29 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           const fwd = new THREE.Vector3(Math.sin(S.heading), 0, Math.cos(S.heading));
           const frontFree = free(sp.x + fwd.x * probe, sp.z + fwd.z * probe);
           let goalH = desiredH;
+          let wallMode = false;
+          const wall = nearestWall(sp.x, sp.z, SP_R + 1.6);
           if (moveScale > 0 && !frontFree) {
-            const leftFree = free(sp.x + Math.sin(S.heading + 1.2) * probe, sp.z + Math.cos(S.heading + 1.2) * probe);
-            const rightFree = free(sp.x + Math.sin(S.heading - 1.2) * probe, sp.z + Math.cos(S.heading - 1.2) * probe);
-            if (leftFree && !rightFree) goalH = S.heading + 1.2;
-            else if (rightFree && !leftFree) goalH = S.heading - 1.2;
-            else if (leftFree && rightFree) goalH = wrapPi(desiredH - S.heading) > 0 ? S.heading + 1.2 : S.heading - 1.2;
-            else goalH = S.heading + Math.PI;            // тупик → плавный разворот
+            if (ENABLE_WALL_CLIMB && wall && !wall.outer) {
+              goalH = desiredH;
+              S.wallClimb = 1.0;
+              S.wallNx = wall.nx;
+              S.wallNz = wall.nz;
+              wallMode = true;
+            } else {
+              const leftFree = free(sp.x + Math.sin(S.heading + 1.2) * probe, sp.z + Math.cos(S.heading + 1.2) * probe);
+              const rightFree = free(sp.x + Math.sin(S.heading - 1.2) * probe, sp.z + Math.cos(S.heading - 1.2) * probe);
+              if (leftFree && !rightFree) goalH = S.heading + 1.2;
+              else if (rightFree && !leftFree) goalH = S.heading - 1.2;
+              else if (leftFree && rightFree) goalH = wrapPi(desiredH - S.heading) > 0 ? S.heading + 1.2 : S.heading - 1.2;
+              else goalH = S.heading + Math.PI;            // тупик → плавный разворот
+            }
+          } else if (ENABLE_WALL_CLIMB && S.wallClimb > 0 && wall && !wall.outer) {
+            S.wallNx = wall.nx;
+            S.wallNz = wall.nz;
+            wallMode = true;
           }
+          if (!wallMode) S.wallClimb = Math.max(0, S.wallClimb - dt * 2.5);
           S.heading += Math.max(-turnRate * dt, Math.min(turnRate * dt, wrapPi(goalH - S.heading)));
 
           // ── ДВИЖЕНИЕ (на резком довороте — медленнее: плавные дуги, без рывков) ──
@@ -1843,10 +2581,15 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           const spd = dt * baseSpeed * moveScale * (S.state === 'CHASE' ? 1 : 0.35 + 0.65 * aligned);
           const before = sp.clone();
           if (spd > 0) {
-            sp.x += Math.sin(S.heading) * spd; sp.z += Math.cos(S.heading) * spd;
+            if (S.wallClimb > 0) {
+              sp.x += Math.sin(S.heading) * spd;
+              sp.z += Math.cos(S.heading) * spd;
+            } else {
+              sp.x += Math.sin(S.heading) * spd; sp.z += Math.cos(S.heading) * spd;
+            }
             sp.x = Math.min(maxWX - 1, Math.max(minWX + 1, sp.x));
             sp.z = Math.min(maxWZ - 1, Math.max(minWZ + 1, sp.z));
-            resolveCircle(sp, SP_R);                     // тело не проходит сквозь стены
+            if (S.wallClimb <= 0) resolveCircle(sp, SP_R); // на полу тело не проходит сквозь стены
           }
           const moved = before.distanceTo(sp);
           S.dist += moved;
@@ -1866,13 +2609,29 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
           // ── ПОХОДКА (тетраподная) ──
           const gait = S.dist * 1.9;
+          const wallPose = S.wallClimb > 0 ? Math.min(1, S.wallClimb / 0.35) : 0;
           for (const L of S.legs) {
             const { swing, lift } = spiderLegPose(gait + L.phase);
-            L.legG.rotation.y = L.baseY + swing * 0.42;
-            L.fem.rotation.z = L.baseFemur + L.side * lift * 0.7;
-            L.tib.rotation.z = L.baseTibia + L.side * lift * 0.5;
+            if (wallPose > 0) {
+              const wallFemur = -L.side * 0.22;
+              const wallTibia = -L.side * (Math.PI - 0.18) - wallFemur;
+              L.legG.position.set(
+                THREE.MathUtils.lerp(L.rootX, L.side * S.touchR * 0.18, wallPose),
+                L.rootY,
+                L.rootZ,
+              );
+              L.legG.rotation.y = THREE.MathUtils.lerp(L.baseY + swing * 0.42, L.baseY * 0.42 + swing * 0.14, wallPose);
+              L.fem.rotation.z = THREE.MathUtils.lerp(L.baseFemur + L.side * lift * 0.7, wallFemur, wallPose);
+              L.tib.rotation.z = THREE.MathUtils.lerp(L.baseTibia + L.side * lift * 0.5, wallTibia, wallPose);
+            } else {
+              L.legG.position.set(L.rootX, L.rootY, L.rootZ);
+              L.legG.rotation.y = L.baseY + swing * 0.42;
+              L.fem.rotation.z = L.baseFemur + L.side * lift * 0.7;
+              L.tib.rotation.z = L.baseTibia + L.side * lift * 0.5;
+            }
           }
-          sp.y = S.bodyY + Math.abs(Math.sin(gait)) * S.touchR * 0.06;
+          S.wallDrop.visible = wallPose > 0;
+          sp.y = (S.wallClimb > 0 ? WALL_H + S.bodyY : S.bodyY) + Math.abs(Math.sin(gait)) * S.touchR * 0.06;
 
           // ── КАСАНИЕ → смерть: тело паука ИЛИ реальный кончик лапы ──
           if (!finished) {
@@ -1885,6 +2644,13 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
                 const fdx = tmpFoot.x - player.position.x, fdz = tmpFoot.z - player.position.z;
                 if (fdx * fdx + fdz * fdz < footR * footR) { touched = true; break; }
               }
+            }
+            if (!touched && S.wallClimb > 0) {
+              const hangX = sp.x - S.wallNx * (S.touchR * 0.55);
+              const hangZ = sp.z - S.wallNz * (S.touchR * 0.55);
+              const hdx = hangX - player.position.x, hdz = hangZ - player.position.z;
+              const hangR = PLAYER_R + S.touchR * 0.65;
+              touched = hdx * hdx + hdz * hdz < hangR * hangR;
             }
             if (touched) { deadFlag = true; finished = true; setDead(true); playScream(); }
           }
@@ -1919,16 +2685,26 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
 
       if (mapView) {
         // ── Режим карты: вся темнота убрана, видно карту целиком ──
-        player.visible = true;
+        if (camera.fov !== 55) { camera.fov = 55; camera.updateProjectionMatrix(); }
+        player.visible = false;
+        for (const S of spiders) S.group.visible = false;
         ambient.intensity = 1.4;
         lantern.distance = 200;
         glow.distance = 200;
         lantern.position.set(player.position.x, 30, player.position.z);
         glow.position.set(player.position.x, 30, player.position.z);
         zoneMarks.forEach((m) => (m.visible = false));
-        // камера высоко над центром — видно всю карту
-        camera.position.set(0, 52, 0.001);
-        camera.lookAt(0, 0, 0);
+        // Камера высоко над центром: высота считается так, чтобы вся карта влезала на любом уровне.
+        const mapCenterX = (bxMin + bxMax) / 2;
+        const mapCenterZ = (bzMin + bzMax) / 2;
+        const mapW = bxMax - bxMin + 16 * mapScale;
+        const mapH = bzMax - bzMin + 16 * mapScale;
+        const fov = THREE.MathUtils.degToRad(camera.fov);
+        const fitByHeight = mapH / (2 * Math.tan(fov / 2));
+        const fitByWidth = mapW / (2 * Math.tan(fov / 2) * camera.aspect);
+        const mapViewY = Math.max(fitByHeight, fitByWidth, 52) + 8 * mapScale;
+        camera.position.set(mapCenterX, mapViewY, mapCenterZ + 0.001);
+        camera.lookAt(mapCenterX, 0, mapCenterZ);
       } else {
         // ── Обычный режим: фонарь + тени + тёмные зоны ──
         ambient.intensity = 0.35;
@@ -1946,13 +2722,15 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         glow.distance = Math.min(5.5, vision); // в тёмной зоне не больше обзора
 
         if (firstPersonRef.current) {
+          if (camera.fov !== 72) { camera.fov = 72; camera.updateProjectionMatrix(); }
           // ── От первого лица: камера в «глазах», смотрит по направлению взгляда ──
           player.visible = false; // своё тело не загораживает обзор
-          const eyeH = 3.6;
+          const eyeH = 2.85;
           const fx = Math.sin(faceAngle), fz = Math.cos(faceAngle);
-          camera.position.set(player.position.x + fx * 0.3, eyeH, player.position.z + fz * 0.3);
-          camera.lookAt(player.position.x + fx * 12, eyeH - 1.2, player.position.z + fz * 12);
+          camera.position.set(player.position.x + fx * 0.22, eyeH, player.position.z + fz * 0.22);
+          camera.lookAt(player.position.x + fx * 14, eyeH - 0.08, player.position.z + fz * 14);
         } else {
+          if (camera.fov !== 55) { camera.fov = 55; camera.updateProjectionMatrix(); }
           // ── От третьего лица: камера сверху, под небольшим углом ──
           player.visible = true;
           camera.position.set(player.position.x, 22, player.position.z + 11);
@@ -1976,8 +2754,13 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     return () => {
       cancelAnimationFrame(frameId);
       getStateRef.current = undefined;
+      switchFnRef.current = undefined;
+      mobileInputRef.current = { mx: 0, mz: 0 };
+      setStick({ x: 0, y: 0, active: false });
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('mousemove', onMouseMove);
+      renderer.domElement.removeEventListener('click', onCanvasClick);
       window.removeEventListener('resize', onResize);
       envRT.dispose();
       renderer.dispose();
@@ -1985,17 +2768,45 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
     };
   }, [runId, level]);
 
+  const touchButtonStyle = {
+    width: 64,
+    height: 64,
+    borderRadius: '50%',
+    border: '1px solid rgba(255,255,255,0.35)',
+    background: 'rgba(8,12,16,0.72)',
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: 'bold',
+    fontFamily: 'monospace',
+    boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
+    touchAction: 'none',
+    userSelect: 'none',
+  } as const;
+
   return (
-    <div style={{ position: 'fixed', inset: 0, width: '100vw', height: '100vh', overflow: 'hidden', background: '#05070a' }}>
+    <div style={{ position: 'fixed', inset: 0, width: '100vw', height: '100vh', overflow: 'hidden', background: '#05070a', touchAction: 'none' }}>
       {/* Живая 3D-сцена игры — рендерится всегда; на меню служит фоном */}
       <div ref={mountRef} style={{ width: '100%', height: '100%' }} />
 
       {/* «Лифтовая» музыка меню (зациклена) */}
       <audio ref={audioRef} src="/menu-music.mp3" loop preload="auto" />
 
+      {finalEnding && (
+        <div
+          style={{
+            position: 'absolute', inset: 0, zIndex: 80,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: '#000', color: '#fff', fontFamily: 'monospace',
+            fontSize: 'min(14vw, 120px)', fontWeight: 'bold', letterSpacing: 8,
+          }}
+        >
+          КОНЕЦ
+        </div>
+      )}
+
 
       {/* HUD — только в игре */}
-      {started && (
+      {started && !finalEnding && (
         <>
           {/* Кнопка вида: от 1-го ↔ от 3-го лица (та же кнопка возвращает обратно) */}
           <button
@@ -2027,9 +2838,11 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
                 🚨 {switchesOn}/{switchCount}
               </span>
             )}
-            <span style={{ color: satiety <= 1 ? '#ff5a3c' : '#ffb44a' }} title="Сытость (ешь мясо!)">
-              {'🍖'.repeat(Math.max(0, Math.ceil(satiety)))}{satiety <= 0 ? '☠' : ''}
-            </span>
+            {spiderAbil.some((a) => a.en === 'STARVE YOU') && (
+              <span style={{ color: satiety <= 1 ? '#ff5a3c' : '#ffb44a' }} title="Сытость (ешь мясо!)">
+                {'🍖'.repeat(Math.max(0, satiety))}{satiety <= 0 ? '☠' : ''}
+              </span>
+            )}
           </div>
 
           {/* Способности паука на этом уровне */}
@@ -2092,18 +2905,107 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
             </div>
           )}
 
+          {showTouchControls && !showIntro && !paused && !dead && !starved && !won && !levelCleared && (
+            <>
+              <div
+                ref={joystickRef}
+                onPointerDown={(e) => {
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  updateJoystick(e.clientX, e.clientY);
+                }}
+                onPointerMove={(e) => updateJoystick(e.clientX, e.clientY)}
+                onPointerUp={clearJoystick}
+                onPointerCancel={clearJoystick}
+                style={{
+                  position: 'absolute',
+                  left: 22,
+                  bottom: 24,
+                  width: 142,
+                  height: 142,
+                  borderRadius: '50%',
+                  border: '1px solid rgba(255,255,255,0.28)',
+                  background: 'rgba(8,12,16,0.42)',
+                  boxShadow: '0 10px 34px rgba(0,0,0,0.42), inset 0 0 22px rgba(255,255,255,0.05)',
+                  touchAction: 'none',
+                  userSelect: 'none',
+                  zIndex: 45,
+                }}
+              >
+                <div
+                  style={{
+                    position: 'absolute',
+                    left: '50%',
+                    top: '50%',
+                    width: 64,
+                    height: 64,
+                    marginLeft: -32,
+                    marginTop: -32,
+                    borderRadius: '50%',
+                    border: '1px solid rgba(255,255,255,0.42)',
+                    background: stick.active ? 'rgba(43,210,79,0.78)' : 'rgba(255,255,255,0.2)',
+                    transform: `translate(${stick.x}px, ${stick.y}px)`,
+                    boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
+                  }}
+                />
+              </div>
+
+              <div
+                style={{
+                  position: 'absolute',
+                  right: 18,
+                  bottom: 24,
+                  display: 'grid',
+                  gridTemplateColumns: '64px 64px',
+                  gap: 12,
+                  zIndex: 45,
+                }}
+              >
+                <button
+                  onPointerDown={(e) => { e.preventDefault(); dropFnRef.current?.(); }}
+                  style={touchButtonStyle}
+                >
+                  DROP
+                </button>
+                <button
+                  onPointerDown={(e) => { e.preventDefault(); switchFnRef.current?.(); }}
+                  style={{ ...touchButtonStyle, background: 'rgba(255,138,42,0.72)', color: '#120806' }}
+                >
+                  ACT
+                </button>
+                <button
+                  onPointerDown={(e) => { e.preventDefault(); setFirstPerson((v) => !v); }}
+                  style={touchButtonStyle}
+                >
+                  VIEW
+                </button>
+                <button
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    if (!pausedRef.current) pause();
+                    else resume();
+                  }}
+                  style={touchButtonStyle}
+                >
+                  PAUSE
+                </button>
+              </div>
+            </>
+          )}
+
           {/* Подсказка управления — левый нижний угол */}
-          <div
-            style={{
-              position: 'absolute', bottom: 12, left: 12,
-              background: 'rgba(0,0,0,0.6)', color: '#fff',
-              padding: '8px 12px', borderRadius: 8, fontSize: 13,
-              pointerEvents: 'none', lineHeight: 1.5,
-            }}
-          >
-            <b>WASD</b> / стрелки — движение · <b>M</b> — вся карта · <b>Q</b> — выбросить{switchCount > 0 ? ' · ' : ''}{switchCount > 0 ? <b>E</b> : ''}{switchCount > 0 ? ' — переключатель' : ''} · <b>Esc</b> — пауза<br />
-            Подбери батарейку (подойди к ней) и отнеси к красному генератору{switchCount > 0 ? ', затем дёрни переключатели' : ''}
-          </div>
+          {!showTouchControls && (
+            <div
+              style={{
+                position: 'absolute', bottom: 12, left: 12,
+                background: 'rgba(0,0,0,0.6)', color: '#fff',
+                padding: '8px 12px', borderRadius: 8, fontSize: 13,
+                pointerEvents: 'none', lineHeight: 1.5,
+              }}
+            >
+              <b>WASD</b> / стрелки — движение · <b>M</b> — вся карта · <b>Q</b> — выбросить{switchCount > 0 ? ' · ' : ''}{switchCount > 0 ? <b>E</b> : ''}{switchCount > 0 ? ' — переключатель' : ''} · <b>Esc</b> — пауза<br />
+              Подбери батарейку (подойди к ней) и отнеси к красному генератору{switchCount > 0 ? ', затем дёрни переключатели' : ''}
+            </div>
+          )}
         </>
       )}
 
@@ -2177,7 +3079,8 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
         <div
           style={{
             position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
-            alignItems: 'center', justifyContent: 'center', gap: 22, zIndex: 20,
+            alignItems: 'flex-start', justifyContent: 'center', gap: 22, zIndex: 20,
+            paddingLeft: 'min(9vw, 120px)',
             background: 'rgba(4,2,3,0.88)', color: '#fff', fontFamily: 'monospace',
           }}
         >
@@ -2186,27 +3089,34 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           </div>
           <div
             style={{
-              fontSize: 'min(8vw, 74px)', fontWeight: 'bold', letterSpacing: 3, textAlign: 'center',
-              padding: '0 16px', textShadow: '0 0 24px #ff2a1a, 0 0 48px #7a0000',
+              fontSize: 'min(6.2vw, 52px)', fontWeight: 'bold', letterSpacing: 2, textAlign: 'left',
+              padding: '0 16px 0 0', textShadow: '0 0 24px #ff2a1a, 0 0 48px #7a0000',
             }}
           >
-            {'SPAID CAN ' + spiderAbil.map((a) => a.en).join(', ')}
+            SPAID CAN
           </div>
-          {level > 1 && (
-            <div style={{ fontSize: 13, color: '#c8a8ff', marginTop: -8 }}>
-              паук адаптируется под твою тактику — придётся менять стиль
-            </div>
-          )}
-          <div style={{ width: 'min(88vw, 640px)', display: 'flex', flexDirection: 'column', gap: 9 }}>
+          <div style={{ width: 'min(78vw, 640px)', display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-start', gap: 10 }}>
             {spiderAbil.map((a) => (
-              <div key={a.en} style={{ fontSize: 'min(2.6vw, 16px)', lineHeight: 1.4, color: '#d8dde3' }}>
-                <span style={{ color: '#ff6a55', fontWeight: 'bold' }}>🕷 {a.en}</span> — {a.ru}
+              <div
+                key={a.en}
+                style={{
+                  padding: '8px 12px',
+                  border: '1px solid rgba(255,106,85,0.45)',
+                  color: '#ff6a55',
+                  fontSize: 'min(2.6vw, 13px)',
+                  fontWeight: 'bold',
+                  letterSpacing: 1,
+                  background: 'rgba(255,42,26,0.08)',
+                }}
+              >
+                {a.en}
               </div>
             ))}
           </div>
           <button
             onClick={() => setShowIntro(false)}
             style={{
+              alignSelf: 'center',
               marginTop: 6, padding: '16px 44px', fontSize: 22, fontWeight: 'bold', fontFamily: 'monospace',
               background: '#c0160c', color: '#fff', border: 'none', borderRadius: 12, cursor: 'pointer',
               boxShadow: '0 4px 18px rgba(0,0,0,0.6)',
@@ -2268,7 +3178,6 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
           >
             УРОВЕНЬ {level}<br />ПРОЙДЕН
           </div>
-          <div style={{ fontSize: 18, opacity: 0.8 }}>Дальше будет сложнее…</div>
           <button
             onClick={nextLevel}
             style={{
@@ -2492,7 +3401,7 @@ export function Space3D({ onLogout }: { onLogout?: () => void }) {
             &nbsp;и отнесите их к&nbsp;
             <span style={{ color: '#ff5a47' }}>красному генератору</span>, нажмите все&nbsp;
             <span style={{ color: '#ff8a2a' }}>кнопки-переключатели</span>
-            &nbsp;на стенах (клавиша&nbsp;E) — и пройдите все 6&nbsp;уровней.
+            &nbsp;на стенах (клавиша&nbsp;E) — и пройдите все {LEVELS}&nbsp;уровней.
             Не попадитесь пауку: одно касание&nbsp;— и&nbsp;конец.
           </div>
         </div>
